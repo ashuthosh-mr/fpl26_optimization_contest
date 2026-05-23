@@ -2459,9 +2459,9 @@ async def run_test_mode(input_dcp: Path, output_dcp: Path, debug: bool = False, 
         await tester.start_servers()
         
         if design_type == "logicnets":
-            success = await tester.run_test_logicnets(input_dcp, output_dcp)
+            success = await tester.run_test_kitta(input_dcp, output_dcp)
         else:
-            success = await tester.run_test_vexriscv(input_dcp, output_dcp)
+            success = await tester.run_test_kitta(input_dcp, output_dcp)
         
         if success:
             print("\n[TEST] Test completed successfully")
