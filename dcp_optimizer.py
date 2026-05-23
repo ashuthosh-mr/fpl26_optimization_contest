@@ -1795,7 +1795,200 @@ class FPGAOptimizerTest(DCPOptimizerBase):
             print(f"\n*** TEST FAILED ***")
             print(f"Exception: {type(e).__name__}: {e}")
             return False
-    
+############# Adding my own test flow: kitta 
+    async def run_test_kitta(self, input_dcp: Path, output_dcp: Path, max_nets_to_optimize: int = 5) -> bool:
+        """
+        Run the deterministic test optimization flow.
+        
+        Steps:
+        1. Open the input DCP in Vivado (done)
+        2. Report timing in Vivado (done)
+        3. Get the critical path report from Vivado (done)
+        4. Run a physical opt design in Vivado (done) 
+        5. Route the design in Vivado (done)
+        7. Write the DCP (done)
+        6. Report timing and compare WNS (done)
+        """
+        print("\n" + "="*70)
+        print("FPGA OPTIMIZER TEST MODE")
+        print("="*70)
+        print(f"Input DCP:  {input_dcp}")
+        print(f"Output DCP: {output_dcp}")
+        print(f"Temp dir:   {self.temp_dir}")
+        print(f"Max nets to optimize: {max_nets_to_optimize}")
+        print("="*70 + "\n")
+        
+        overall_start = time.time()
+        
+        try:
+            # ================================================================
+            # Step 0: Initialize RapidWright (Vivado starts automatically)
+            # ================================================================
+            print("\n" + "-"*60)
+            print("STEP 0: Initialize RapidWright")
+            print("-"*60)
+            
+            # Initialize RapidWright (Vivado will auto-start when first used)
+            result = await self.call_rapidwright_tool("initialize_rapidwright", {
+                "jvm_max_memory": "8G"
+            }, timeout=120.0)
+            print(f"RapidWright init result:\n{result[:500]}...")
+            logger.info(f"RapidWright init result: {result}")
+            
+            # ================================================================
+            # Step 1: Open the input DCP in Vivado
+            # ================================================================
+            print("\n" + "-"*60)
+            print("STEP 1: Open input DCP in Vivado")
+            print("-"*60)
+            
+            result = await self.call_vivado_tool("open_checkpoint", {
+                "dcp_path": str(input_dcp.resolve())
+            }, timeout=600.0)
+            print(f"Open checkpoint result:\n{result}")
+            logger.info(f"Open checkpoint result: {result}")
+            
+            # ================================================================
+            # Step 2: Report timing in Vivado
+            # ================================================================
+            print("\n" + "-"*60)
+            print("STEP 2: Report timing in Vivado")
+            print("-"*60)
+            
+            result = await self.call_vivado_tool("report_timing_summary", {}, timeout=300.0)
+            print(f"Timing summary (first 2000 chars):\n{result[:2000]}...")
+            logger.info(f"Initial timing summary: {result}")
+            
+            # Get clock period for fmax calculation (also detects target clock)
+            self.clock_period = await self.fetch_clock_period()
+            
+            # Get WNS for the target clock domain
+            target_wns = await self.get_wns_for_target_clock(self._call_vivado_for_clock)
+            if target_wns is not None:
+                self.initial_wns = target_wns
+            else:
+                self.initial_wns = self.parse_wns_from_timing_report(result)
+            
+            self.print_fmax_status("Initial", self.initial_wns)
+            logger.info(f"Initial WNS: {self.initial_wns} ns")
+            print()
+            
+            # ================================================================
+            # Step 3: Get the critical path report from Vivado
+            # ================================================================
+            print("\n" + "-"*60)
+            print("STEP 3: Get the critical path report from Vivado")
+            print("-"*60)
+            kitty = """ report_timing -max_paths 1 """
+            result = await self.call_vivado_tool("run_tcl", {
+                "command": kitty
+            }, timeout=600.0)
+
+            print(f"Maximum critical path report:\n{result}")
+            logger.info(f"Kitty critical path: {result}")
+                        
+            # ================================================================
+            # Step 4: Run a physical opt design in Vivado
+            # ================================================================
+            print("\n" + "-"*60)
+            print("STEP 4: Run physical optimization in Vivado")
+            print("-"*60)
+            kitty = """phys_opt_design"""
+            result = await self.call_vivado_tool("run_tcl", {
+                "command": kitty
+            }, timeout=600.0)
+            
+            print(f" physical opt done:\n")
+            logger.info(f"physical opt done")
+            
+            # ================================================================
+            # Step 5: Route the design in Vivado
+            # ================================================================
+            print("\n" + "-"*60)
+            print("STEP 5: Route the design in Vivado")
+            print("-"*60)
+            # First check route status
+            result = await self.call_vivado_tool("report_route_status", {
+                "show_unrouted": True,
+                "show_errors": True,
+                "max_nets": 20
+            }, timeout=300.0)
+            print(f"Route status before routing:\n{result[:1500]}...")
+            logger.info(f"Route status before routing: {result}")
+            
+            # Route the design
+            result = await self.call_vivado_tool("route_design", {
+                "directive": "Default",
+            }, timeout=600.0)  # 2 hour timeout for routing
+            print(f"Route design result:\n{result}")
+            logger.info(f"Route design: {result}")
+            
+            # Check route status again
+            result = await self.call_vivado_tool("report_route_status", {
+                "show_unrouted": True,
+                "show_errors": True,
+                "max_nets": 20
+            }, timeout=300.0)
+            print(f"Route status after routing:\n{result[:1500]}...")
+            logger.info(f"Route status after routing: {result}")
+            
+            # ================================================================
+            # Step 6: Report final timing
+            # ================================================================
+            print("\n" + "-"*60)
+            print("STEP 9: Report final timing")
+            print("-"*60)
+            
+            result = await self.call_vivado_tool("report_timing_summary", {}, timeout=300.0)
+            print(f"Final timing summary (first 2000 chars):\n{result[:2000]}...")
+            logger.info(f"Final timing summary: {result}")
+            
+            # Get final WNS for the target clock domain
+            target_wns = await self.get_wns_for_target_clock(self._call_vivado_for_clock)
+            if target_wns is not None:
+                self.final_wns = target_wns
+            else:
+                self.final_wns = self.parse_wns_from_timing_report(result)
+            
+            self.print_fmax_status("Final", self.final_wns)
+            logger.info(f"Final WNS: {self.final_wns} ns")
+            print()
+            
+            # ================================================================
+            # Step 7: Write final DCP and report results
+            # ================================================================
+            self.print_wns_change(self.initial_wns, self.final_wns, self.clock_period)
+            
+            # Always write the final checkpoint (regardless of improvement)
+            print(f"\nWriting final DCP to: {output_dcp}")
+            result = await self.call_vivado_tool("write_checkpoint", {
+                "dcp_path": str(output_dcp.resolve()),
+                "force": True
+            }, timeout=600.0)
+            print(f"Write final DCP result:\n{result}")
+            
+            # ================================================================
+            # Summary
+            # ================================================================
+            elapsed = time.time() - overall_start
+            self.print_test_summary(
+                title="TEST SUMMARY",
+                elapsed_seconds=elapsed,
+                initial_wns=self.initial_wns,
+                final_wns=self.final_wns,
+                clock_period=self.clock_period
+#                extra_info=f"Nets optimized: {successful_optimizations}/{len(nets_to_optimize)}"
+            )
+            
+            return True
+            
+        except Exception as e:
+            logger.exception(f"Test failed with exception: {e}")
+            print(f"\n*** TEST FAILED ***")
+            print(f"Exception: {type(e).__name__}: {e}")
+            return False
+
+
     async def run_test_logicnets(self, input_dcp: Path, output_dcp: Path) -> bool:
         """
         Run the pblock-based optimization flow for LogicNets designs.

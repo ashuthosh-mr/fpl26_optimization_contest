@@ -2,3 +2,13 @@ __pycache__
 *.dcp
 *.log
 *.jou
+dcp_optimizer_run-*/
+dcp_validation_*/
+fpl26_contest_benchmarks_v1.1.0.tar.gz
+fpl26_contest_benchmarks_v1.1.0*/
+venv*/
+.Xil*/
+.ipynb_checkpoints*/
+*.rpt
+fpl26_contest_benchmarks/
+*.str
