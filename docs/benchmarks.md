@@ -58,20 +58,20 @@ submission round. The hidden alpha benchmark `vexriscv_re-place_v2` is not
 covered in this table. All timing is measured on the `clk_fpl26contest` clock
 domain. Each design was given a maximum runtime of 1 hour.
 
-| Benchmark | Initial Fmax (MHz) | Best Fmax (MHz) | Improvement (MHz) | Improvement (%) | WNS Change (ns) | Runtime | Status |
-|---|---:|---:|---:|---:|---|---:|---|
-| `amd_mini-isp` | 307.13 | 375.38 | +68.25 | +22.2% | -1.686 → -1.094 | 619s | Completed |
-| `boom_soc` | 48.24 | 50.77 | +2.53 | +5.2% | -19.162 → -18.126 | 3601s | Timed out |
-| `corescore_500_mod` | 344.23 | 423.37 | +79.14 | +23.0% | -1.238 → -0.695 | 2131s | Completed |
-| `finn_radioml` | 284.90 | 324.46 | +39.56 | +13.9% | -1.910 → -1.482 | 1998s | Completed |
-| `ispd16_example2` | 107.64 | 107.64 | +0.00 | +0.0% | -7.752 → -7.752 | 3600s | Timed out |
-| `logicnets_jscl` | 403.55 | 434.97 | +31.42 | +7.8% | -0.978 → -0.799 | 825s | Completed |
-| `rosetta_3d-rendering` | 270.93 | 279.25 | +8.32 | +3.1% | -2.153 → -2.043 | 1823s | Completed |
-| `rosetta_digit-recognition` | 366.97 | 390.78 | +23.81 | +6.5% | -1.025 → -0.859 | 1512s | Completed |
-| `rosetta_optical-flow` | 324.89 | 330.14 | +5.26 | +1.6% | -1.078 → -1.029 | 558s | Completed |
-| `rosetta_spam-filter` | 437.45 | 494.07 | +56.63 | +12.9% | -0.686 → -0.424 | 1000s | Completed |
-| `vexriscv_re-place` | 310.17 | 415.28 | +105.11 | +33.9% | -1.654 → -0.838 | 385s | Completed |
-| `vtr_mcml` | 62.25 | 73.05 | +10.80 | +17.4% | -14.527 → -12.152 | 1689s | Completed |
+| Benchmark | Initial Fmax (MHz) | Best Fmax (MHz) | Improvement (MHz) | Improvement (%) | WNS Change (ns) | Runtime | Status | first_opt (MHz) (43dd108)  |
+|---|---:|---:|---:|---:|---|---:|---|---:|
+| `amd_mini-isp` | 307.13 | 375.38 | +68.25 | +22.2% | -1.686 → -1.094 | 619s | Completed | - |
+| `boom_soc` | 48.24 | 50.77 | +2.53 | +5.2% | -19.162 → -18.126 | 3601s | Timed out | - |
+| `corescore_500_mod` | 344.23 | 423.37 | +79.14 | +23.0% | -1.238 → -0.695 | 2131s | Completed | - |
+| `finn_radioml` | 284.90 | 324.46 | +39.56 | +13.9% | -1.910 → -1.482 | 1998s | Completed | - |
+| `ispd16_example2` | 107.64 | 107.64 | +0.00 | +0.0% | -7.752 → -7.752 | 3600s | Timed out | - |
+| `logicnets_jscl` | 403.55 | 434.97 | +31.42 | +7.8% | -0.978 → -0.799 | 825s | Completed | - |
+| `rosetta_3d-rendering` | 270.93 | 279.25 | +8.32 | +3.1% | -2.153 → -2.043 | 1823s | Completed | - |
+| `rosetta_digit-recognition` | 366.97 | 390.78 | +23.81 | +6.5% | -1.025 → -0.859 | 1512s | Completed | - |
+| `rosetta_optical-flow` | 324.89 | 330.14 | +5.26 | +1.6% | -1.078 → -1.029 | 558s | Completed | - |
+| `rosetta_spam-filter` | 437.45 | 494.07 | +56.63 | +12.9% | -0.686 → -0.424 | 1000s | Completed | - |
+| `vexriscv_re-place` | 310.17 | 415.28 | +105.11 | +33.9% | -1.654 → -0.838 | 385s | Completed | 411.18 |
+| `vtr_mcml` | 62.25 | 73.05 | +10.80 | +17.4% | -14.527 → -12.152 | 1689s | Completed | - |
 
 **Summary:** 10 of 12 designs completed within the 1-hour limit. Average Fmax
 improvement across completed designs was +44.2 MHz (+14.7%). The best single
