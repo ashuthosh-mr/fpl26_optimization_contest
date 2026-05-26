@@ -2437,7 +2437,8 @@ async def run_test_mode(input_dcp: Path, output_dcp: Path, debug: bool = False, 
     """
     # Detect which DCP is being used based on filename
     dcp_name = input_dcp.name.lower()
-    
+    design_type = dcp_name.split(".")[0]  # Get the part before .dcp
+    '''
     if "logicnets" in dcp_name:
         design_type = "logicnets"
         print(f"[TEST] Detected LogicNets design - using pblock optimization flow")
@@ -2452,7 +2453,7 @@ async def run_test_mode(input_dcp: Path, output_dcp: Path, debug: bool = False, 
         print(f"[TEST]")
         print(f"[TEST] For custom DCPs, run without --test to use the LLM-guided optimizer.")
         return 1
-    
+    '''
     tester = FPGAOptimizerTest(debug=debug, run_dir=run_dir)
     
     try:
