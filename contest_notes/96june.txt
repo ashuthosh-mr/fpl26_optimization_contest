@@ -1,0 +1,115 @@
+## PhysOpt vs RapidWright Placement Experiments
+
+### Objective
+
+Evaluate whether RapidWright placement optimizations can provide additional gains after Vivado physical optimization.
+
+### Baseline Results
+
+| Flow                 | Approx. Fmax |
+| -------------------- | ------------ |
+| Original benchmark   | ~311 MHz     |
+| Vivado phys_opt flow | ~411 MHz     |
+
+Vivado physical optimization alone improved performance significantly, increasing Fmax from approximately 311 MHz to 411 MHz.
+
+---
+
+### Experiment 1 - Manual MUL Register Move
+
+Cell:
+
+```text
+memory_to_writeBack_MUL_LOW_reg[35]
+```
+
+Result:
+
+```text
+SLICE_X124Y12 → SLICE_X125Y12
+```
+
+After routing and timing analysis:
+
+```text
+WNS: -0.862 ns → -0.910 ns
+```
+
+Timing worsened.
+
+---
+
+### Experiment 2 - Manual RegFile LUT Move
+
+Cell:
+
+```text
+dataCache_1/RegFilePlugin_regFile_reg_r1_0_31_28_31_i_3
+```
+
+Result:
+
+```text
+SLICE_X115Y15 → SLICE_X112Y18
+```
+
+The move was significantly larger than the MUL register experiment, indicating that RapidWright believed the cell was misplaced.
+
+After routing and timing analysis:
+
+```text
+WNS ≈ -0.910 ns
+```
+
+No improvement was observed.
+
+---
+
+### Experiment 3 - Full run_test_vexriscv Flow on 411 MHz Design
+
+The contest-provided `run_test_vexriscv` flow was executed on the 411 MHz design.
+
+Selected cell:
+
+```text
+dataCache_1/ways_0_tags_reg_i_22
+```
+
+Placement change:
+
+```text
+SLICE_X115Y14 → SLICE_X113Y22
+```
+
+Distance moved:
+
+```text
+9 tiles
+```
+
+After routing:
+
+```text
+Initial WNS: -0.862 ns
+Final WNS:   -1.133 ns
+
+Initial Fmax: 411.18 MHz
+Final Fmax:   369.96 MHz
+
+Change: -41.22 MHz
+```
+
+This was the largest degradation observed.
+
+### Key Observation
+
+The RapidWright placement optimization strategy that improves the original benchmark (311 MHz → ~320-350 MHz) does not provide additional benefit after Vivado physical optimization has already improved the design to ~411 MHz.
+
+All placement experiments performed after the phys_opt stage either produced no improvement or significantly degraded timing.
+
+### Current Hypothesis
+
+The timing bottleneck present in the original benchmark appears to be largely addressed by Vivado physical optimization. The remaining timing violations in the ~411 MHz design are likely caused by a different bottleneck than the one targeted by the contest's centroid-based placement optimization flow.
+
+Future work should focus on characterizing the post-phys_opt critical paths rather than continuing single-cell placement experiments.
+

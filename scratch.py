@@ -429,9 +429,103 @@ async def main():
 
                 for match in data[:5]:
                     print(match)
-
             except Exception:
                 print(result[:1000])            
+
+        interesting_cells = [
+            # Worst spread hotspot
+            "memory_to_writeBack_MUL_LOW_reg[35]",
+            "dataCache_1/HazardSimplePlugin_writeBackBuffer_payload_data[6]_i_7",
+
+            # Neighboring MUL bits
+            "memory_to_writeBack_MUL_LOW_reg[30]",
+            "memory_to_writeBack_MUL_LOW_reg[31]",
+            "memory_to_writeBack_MUL_LOW_reg[32]",
+            "memory_to_writeBack_MUL_LOW_reg[33]",
+            "memory_to_writeBack_MUL_LOW_reg[34]",
+            "memory_to_writeBack_MUL_LOW_reg[35]",
+            "memory_to_writeBack_MUL_LOW_reg[36]",
+            "memory_to_writeBack_MUL_LOW_reg[37]",
+            "memory_to_writeBack_MUL_LOW_reg[38]",
+            "memory_to_writeBack_MUL_LOW_reg[39]",
+            # Neighboring payload bits
+            "dataCache_1/HazardSimplePlugin_writeBackBuffer_payload_data[5]_i_7",
+            "dataCache_1/HazardSimplePlugin_writeBackBuffer_payload_data[7]_i_7",
+            "dataCache_1/HazardSimplePlugin_writeBackBuffer_payload_data[8]_i_7",
+
+            # Cells later in the same critical path
+            "dataCache_1/HazardSimplePlugin_writeBackBuffer_payload_data[31]_i_1",
+            "dataCache_1/RegFilePlugin_regFile_reg_r1_0_31_28_31_i_3",
+        ]
+
+        print("\n" + "="*80)
+        print("SPREAD HOTSPOT INVESTIGATION")
+        print("="*80)
+
+        for cell in interesting_cells:
+
+            result = await tester.call_rapidwright_tool(
+                "search_cells",
+                {
+                    "pattern": cell
+                }
+            )
+
+            print("\n" + "-"*60)
+            print(cell)
+            print(result)
+
+        result = await tester.call_rapidwright_tool(
+            "optimize_cell_placement",
+            {
+                "cell_names": [
+                    "dataCache_1/RegFilePlugin_regFile_reg_r1_0_31_28_31_i_3"
+                ]
+            }
+        )
+
+        print(result)
+
+        # After optimize_cell_placement()
+
+        rw_dcp = run_dir / "temp_rw.dcp"
+
+        await tester.call_rapidwright_tool(
+            "write_checkpoint",
+            {
+                "dcp_path": str(rw_dcp)
+            },
+            timeout=600.0
+        )
+
+        # Open in Vivado
+        await tester.call_vivado_tool(
+            "open_checkpoint",
+            {
+                "dcp_path": str(rw_dcp)
+            },
+            timeout=600.0
+        )
+
+        # Re-route
+        await tester.call_vivado_tool(
+            "run_tcl",
+            {
+                "command": "route_design"
+            },
+            timeout=3600.0
+        )
+
+        # Save routed design
+        final_dcp = run_dir / "411mhz_input.dcp"
+
+        await tester.call_vivado_tool(
+            "run_tcl",
+            {
+                "command": f"write_checkpoint -force {final_dcp}"
+            },
+            timeout=600.0
+        )
     except Exception:
         logger.exception("Scratch run failed")
         raise

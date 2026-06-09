@@ -1,0 +1,78 @@
+# VexRiscv Optimization Notes
+
+## Critical Path Investigation and RapidWright Placement Analysis
+
+### Objective
+
+Investigate whether RapidWright's cell placement optimization can improve timing on the VexRiscv benchmark after routing.
+
+### Analysis Performed
+
+1. Extracted critical paths from the routed design.
+2. Analyzed critical path spread using RapidWright.
+3. Analyzed net detours using `analyze_net_detour`.
+4. Investigated recurring detour hotspots appearing across multiple critical paths.
+
+### Key Findings
+
+#### Critical Path Family
+
+The dominant critical path was observed in the following region:
+
+```text
+memory_to_writeBack_MUL_LOW_reg[*]
+→ HazardSimplePlugin_writeBackBuffer
+→ RegFilePlugin logic
+→ RAMD32
+```
+
+This path family was also present in the original benchmark.
+
+#### Spread Analysis
+
+A large separation (~90 tile units) was observed between:
+
+```text
+memory_to_writeBack_MUL_LOW_reg[35]
+```
+
+and
+
+```text
+dataCache_1/HazardSimplePlugin_writeBackBuffer_payload_data[6]_i_7
+```
+
+suggesting a potential placement issue.
+
+#### Detour Analysis
+
+Several cells repeatedly appeared as detour hotspots:
+
+```text
+dataCache_1/ways_0_tags_reg_i_22
+dataCache_1/stageA_mask[3]_i_1
+dataCache_1/decode_to_execute_ENV_CTRL[0]_i_1
+```
+
+These appeared on multiple critical paths and were identified as potential optimization candidates.
+
+#### Manual Placement Experiment
+
+A manual RapidWright placement optimization was performed on:
+
+```text
+memory_to_writeBack_MUL_LOW_reg[35]
+```
+
+Result:
+
+```text
+SLICE_X124Y12 → SLICE_X125Y12
+```
+
+Only a one-tile movement occurred, indicating that the cell was already near its computed centroid and unlikely to provide significant timing improvement.
+
+### Conclusion
+
+The initial investigation suggested that the remaining timing bottleneck might not be caused by obvious placement issues. The RapidWright centroid-based placement heuristic did not identify large placement errors for the dominant MUL register path.
+
