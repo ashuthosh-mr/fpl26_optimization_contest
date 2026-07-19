@@ -566,7 +566,7 @@ class DCPOptimizer(DCPOptimizerBase):
         model: str = DEFAULT_MODEL,
         debug: bool = False,
         run_dir: Optional[Path] = None,
-        pre_opt: str = "phys_opt,relocate,retime,pblock,cell_replace,reimpl",
+        pre_opt: str = "phys_opt,relocate,pblock,cell_replace,reimpl",
         physopt_directive: str = "",
         pblock_mode: str = "always",
         cell_replace_mode: str = "auto",
@@ -3960,12 +3960,13 @@ Examples:
     parser.add_argument(
         "--pre-opt",
         type=str,
-        default="phys_opt,relocate,retime,pblock,cell_replace,reimpl",
+        default="phys_opt,relocate,pblock,cell_replace,reimpl",
         help="Comma-separated deterministic steps to run (in order) before the LLM stage. "
-             "Supported: phys_opt, relocate, retime, pblock, cell_replace, reimpl, relocate_rw, none. "
+             "Supported: phys_opt, relocate, pblock, cell_replace, reimpl, retime, relocate_rw, none. "
              "'reimpl' (fresh from-scratch place/route) runs LAST as a final fallback and is kept only "
-             "if it beats the incremental steps. "
-             "Default: 'phys_opt,relocate,retime,pblock,cell_replace,reimpl'."
+             "if it beats the incremental steps. 'retime' is available but OFF by default (no measured "
+             "gain on tested benchmarks and it competes with reimpl for the 1hr budget). "
+             "Default: 'phys_opt,relocate,pblock,cell_replace,reimpl'."
     )
     parser.add_argument(
         "--physopt-directive",
