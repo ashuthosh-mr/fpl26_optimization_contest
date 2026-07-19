@@ -566,15 +566,19 @@ class DCPOptimizer(DCPOptimizerBase):
         model: str = DEFAULT_MODEL,
         debug: bool = False,
         run_dir: Optional[Path] = None,
-        pre_opt: str = "phys_opt,relocate,retime,pblock,cell_replace",
+        pre_opt: str = "phys_opt,relocate,retime,pblock,cell_replace,reimpl",
         physopt_directive: str = "",
         pblock_mode: str = "always",
         cell_replace_mode: str = "auto",
         relocate_mode: str = "always",
         retime_mode: str = "always",
+        reimpl_mode: str = "always",
+        reimpl_place_directive: str = "ExtraTimingOpt",
+        reimpl_route_directive: str = "AggressiveExplore",
         skip_llm: bool = False,
         phys_opt_timeout: int = 1200,
         manual_timeout: int = 1200,
+        reimpl_timeout: int = 2400,
         llm_timeout: int = 1200,
         total_timeout: int = 3600,
         cost_cap: float = 1.0
@@ -592,11 +596,15 @@ class DCPOptimizer(DCPOptimizerBase):
         self.cell_replace_mode = cell_replace_mode  # auto | always | never
         self.relocate_mode = relocate_mode        # auto | always | never
         self.retime_mode = retime_mode            # auto | always | never
+        self.reimpl_mode = reimpl_mode            # auto | always | never (final fallback stage)
+        self.reimpl_place_directive = reimpl_place_directive  # place_design directive for re-impl
+        self.reimpl_route_directive = reimpl_route_directive  # route_design directive for re-impl
         self.skip_llm = skip_llm                  # stop after deterministic baseline
         # Wall-clock budgets (seconds) and cost cap ($). Contest limit: 1 hr + $1/benchmark.
         # Phased 20/20/20: phys_opt | manual (pblock + cell_replace SHARE this) | LLM.
         self.phys_opt_timeout = phys_opt_timeout  # phase-1 cap for phys_opt
         self.manual_timeout = manual_timeout      # phase-2 cap SHARED by pblock + cell_replace
+        self.reimpl_timeout = reimpl_timeout      # dedicated cap for the re-impl fallback stage
         self.llm_timeout = llm_timeout            # phase-3 cap for the LLM stage
         self.total_timeout = total_timeout        # hard overall cap (fallback guaranteed)
         self.cost_cap = cost_cap                  # stop LLM before spending more than this
@@ -1580,6 +1588,268 @@ set fh [open {%RESULT%} w]; puts $fh $r; close $fh
             print("✓ Restored protected baseline into Vivado.\n")
         return None
 
+    async def run_relocate_rw_baseline(self, output_dcp: Path, timeout: Optional[int] = None) -> Optional[float]:
+        """Group relocation using RapidWright for the UNPLACE step (iteration-friendly).
+
+        Same critical-cone / hard-anchor selection as run_relocate_baseline, but the
+        cells are unplaced+unrouted in RapidWright (fullyUnplaceCell + Net.unroute), which
+        -- unlike Vivado's unplace_cell -- does NOT fail with "routing contention at pips"
+        on an already-routed design. Vivado then re-places the group under a pblock and
+        routes. Because the RapidWright unplace never contends, this stage can be listed
+        multiple times in pre_opt to iteratively consolidate successive critical cones.
+        Placement/routing-only -> functionally equivalent; adopt only if routed + improved."""
+        print("\n=== Deterministic Pre-LLM Optimization: RapidWright group relocation ===\n")
+        if getattr(self, "relocate_mode", "always") == "never":
+            print("relocation disabled; skipping RW relocation.\n")
+            return None
+        if self.protected_best_dcp is None or not self.protected_best_dcp.exists():
+            print("No protected baseline; skipping RW relocation.\n")
+            return None
+
+        targets_file = Path(self.temp_dir) / "rw_targets.txt"
+        result_file = Path(self.temp_dir) / "rw_result.txt"
+        plan_tcl = Path(self.temp_dir) / "rw_plan.tcl"
+        for f in (targets_file, result_file):
+            if f.exists():
+                try:
+                    f.unlink()
+                except Exception:
+                    pass
+
+        # Same selection procs as run_relocate_baseline, but the final step writes the
+        # target cell names to a file instead of doing the pblock/unplace in Vivado.
+        tcl_body = r'''
+proc _sitetype {cell} { set s [get_sites -quiet -of_objects $cell]; if {$s eq ""} {return ""}; return [get_property SITE_TYPE $s] }
+proc _tile {cell} { return [get_tiles -quiet -of_objects [get_sites -quiet -of_objects $cell]] }
+proc _compact_range {cr acol arow ncells} {
+    set need [expr {int(ceil($ncells/8.0))*4}]
+    if {$need < 16} { set need 16 }
+    set slices {}
+    foreach s [get_sites -quiet -of_objects $cr -filter {SITE_TYPE =~ SLICE*}] {
+        set t [get_tiles -of_objects $s]
+        regexp {SLICE_X(\d+)Y(\d+)} $s -> xx yy
+        lappend slices [list [get_property COLUMN $t] [get_property ROW $t] $xx $yy]
+    }
+    if {[llength $slices] < 4} { return "" }
+    set coldist [dict create]
+    foreach e $slices { set x [lindex $e 2]; set d [expr {abs([lindex $e 0]-$acol)}]
+        if {![dict exists $coldist $x] || $d < [dict get $coldist $x]} { dict set coldist $x $d } }
+    set collist {}
+    dict for {x d} $coldist { lappend collist [list $d $x] }
+    set keepx {}
+    foreach pair [lrange [lsort -integer -index 0 $collist] 0 1] { lappend keepx [lindex $pair 1] }
+    set inband {}
+    foreach e $slices {
+        if {[lsearch $keepx [lindex $e 2]] >= 0} { lappend inband [list [expr {abs([lindex $e 1]-$arow)}] [lindex $e 2] [lindex $e 3]] }
+    }
+    set take [lrange [lsort -integer -index 0 $inband] 0 [expr {$need-1}]]
+    if {[llength $take] < 4} { return "" }
+    set xs {}; set ys {}
+    foreach e $take { lappend xs [lindex $e 1]; lappend ys [lindex $e 2] }
+    set xmin [lindex [lsort -integer $xs] 0]; set xmax [lindex [lsort -integer $xs] end]
+    set ymin [lindex [lsort -integer $ys] 0]; set ymax [lindex [lsort -integer $ys] end]
+    return "SLICE_X${xmin}Y${ymin}:SLICE_X${xmax}Y${ymax}"
+}
+proc _write_targets {targets} {
+    global TFILE
+    set fh [open $TFILE w]
+    foreach c $targets { puts $fh [get_property NAME $c] }
+    close $fh
+}
+proc _plan_anchor {anchor mov hard_re slack} {
+    set at [_tile $anchor]; set mt [_tile $mov]
+    set dist [expr {abs([get_property COLUMN $at]-[get_property COLUMN $mt])+abs([get_property ROW $at]-[get_property ROW $mt])}]
+    if {$dist < 6} { return "SKIP anchor_already_close_dist_$dist" }
+    set base [get_property NAME $mov]; regsub {\[\d+\]$} $base {} base
+    set pat $base ; append pat {[*]}
+    set ffs [get_cells -quiet $pat]
+    if {[llength $ffs] == 0} { set ffs $mov }
+    set inpins [get_pins -quiet -of_objects $ffs -filter {DIRECTION==IN && REF_PIN_NAME!=C}]
+    set drv [get_cells -quiet -of_objects [get_pins -quiet -leaf -of_objects [get_nets -quiet -of_objects $inpins] -filter {DIRECTION==OUT}]]
+    set luts {}
+    foreach c $drv { set st [_sitetype $c]; if {[regexp {SLICE} $st] && ![regexp $hard_re $st]} { lappend luts [get_property NAME $c] } }
+    set targets [get_cells -quiet [lsort -unique [concat [get_property NAME $ffs] $luts]]]
+    if {[llength $targets] == 0} { return "SKIP no_targets" }
+    if {[llength $targets] > 400} { return "SKIP too_many_cells_[llength $targets]" }
+    set cr [get_clock_regions -of_objects [get_sites -of_objects $anchor]]
+    set range [_compact_range $cr [get_property COLUMN $at] [get_property ROW $at] [llength $targets]]
+    if {$range eq ""} { return "SKIP no_slices_near_anchor" }
+    _write_targets $targets
+    return "PLAN ok anchor=[get_property NAME $anchor] dist=$dist ncells=[llength $targets] range=$range slack=$slack"
+}
+proc _plan_cone {hard_re slack} {
+    set paths [get_timing_paths -max_paths 12 -nworst 3 -delay_type max]
+    set names {}
+    foreach p $paths {
+        foreach c [get_cells -quiet -of_objects [get_pins -quiet -of_objects $p]] {
+            set st [_sitetype $c]
+            if {[regexp {SLICE} $st] && ![regexp $hard_re $st]} { lappend names [get_property NAME $c] }
+        }
+    }
+    set targets [get_cells -quiet [lsort -unique $names]]
+    if {[llength $targets] < 4} { return "SKIP cone_too_small_[llength $targets]" }
+    if {[llength $targets] > 600} { return "SKIP cone_too_large_[llength $targets]" }
+    set sc 0; set sr 0; set n 0; set cols {}; set rows {}; set crcount [dict create]
+    foreach c $targets {
+        set t [_tile $c]
+        if {$t ne ""} {
+            set cc [get_property COLUMN $t]; set rr [get_property ROW $t]
+            set sc [expr {$sc+$cc}]; set sr [expr {$sr+$rr}]; incr n
+            lappend cols $cc; lappend rows $rr
+            set creg [get_clock_regions -quiet -of_objects [get_sites -quiet -of_objects $c]]
+            if {$creg ne ""} { dict incr crcount $creg }
+        }
+    }
+    if {$n == 0} { return "SKIP cone_unplaced" }
+    set spread [expr {([lindex [lsort -integer $cols] end]-[lindex [lsort -integer $cols] 0])+([lindex [lsort -integer $rows] end]-[lindex [lsort -integer $rows] 0])}]
+    if {$spread < 12} { return "SKIP cone_already_compact_spread_$spread" }
+    set cr ""; set best 0
+    dict for {k v} $crcount { if {$v > $best} { set best $v; set cr $k } }
+    if {$cr eq ""} { return "SKIP cone_no_region" }
+    set range [_compact_range $cr [expr {$sc/$n}] [expr {$sr/$n}] [llength $targets]]
+    if {$range eq ""} { return "SKIP no_slices_for_cone" }
+    _write_targets $targets
+    return "PLAN ok cone spread=$spread region=$cr ncells=[llength $targets] range=$range slack=$slack"
+}
+proc do_relocate_plan {hard_re} {
+    set p [lindex [get_timing_paths -max_paths 1 -nworst 1 -delay_type max] 0]
+    if {$p eq ""} { return "SKIP no_path" }
+    set slack [get_property SLACK $p]
+    if {$slack >= 0} { return "SKIP timing_met" }
+    set scell [get_cells -quiet -of_objects [get_pins -quiet [get_property STARTPOINT_PIN $p]]]
+    set ecell [get_cells -quiet -of_objects [get_pins -quiet [get_property ENDPOINT_PIN $p]]]
+    if {$scell eq "" || $ecell eq ""} { return "SKIP no_endpoints" }
+    set stype [_sitetype $scell]; set etype [_sitetype $ecell]
+    if {[regexp $hard_re $stype] && ![regexp $hard_re $etype]} {
+        return [_plan_anchor $scell $ecell $hard_re $slack]
+    } elseif {[regexp $hard_re $etype] && ![regexp $hard_re $stype]} {
+        return [_plan_anchor $ecell $scell $hard_re $slack]
+    } else {
+        return [_plan_cone $hard_re $slack]
+    }
+}
+set TFILE "%TARGETS%"
+if {[catch {do_relocate_plan {%HARD%}} r]} { set r "SKIP tcl_error:$r" }
+set fh [open {%RESULT%} w]; puts $fh $r; close $fh
+'''.replace("%HARD%", self._HARD_ANCHOR_RE).replace("%RESULT%", str(result_file.resolve())).replace("%TARGETS%", str(targets_file.resolve()))
+        plan_tcl.write_text(tcl_body)
+
+        await self.call_tool("vivado_run_tcl", {"command": f"source {{{plan_tcl.resolve()}}}"})
+        detail = result_file.read_text().strip() if result_file.exists() else ""
+        if not detail.startswith("PLAN") or not targets_file.exists():
+            print(f"RW relocation not applicable ({detail or 'no result'}); skipping.\n")
+            return None
+        targets = [ln.strip() for ln in targets_file.read_text().splitlines() if ln.strip()]
+        m = re.search(r"range=(\S+)", detail)
+        prange = m.group(1) if m else None
+        if not targets or not prange:
+            print(f"RW relocation: no targets/range parsed ({detail}); skipping.\n")
+            return None
+        print(f"RW relocation plan: {detail} ({len(targets)} cells)")
+
+        # Hand the current design to RapidWright, unplace the group there (no contention),
+        # write it back, then let Vivado place under the pblock and route.
+        stage_in = Path(self.temp_dir) / "rw_stage_in.dcp"
+        stage_out = Path(self.temp_dir) / "rw_stage_out.dcp"
+        await self.call_tool("vivado_write_checkpoint", {"dcp_path": str(stage_in.resolve()), "force": True})
+        rd = await self.call_tool("rapidwright_read_checkpoint", {"dcp_path": str(stage_in.resolve())})
+        if "error" in rd.lower() and "success" not in rd.lower():
+            print(f"⚠ RapidWright could not read DCP; skipping.\n  {rd[:200]}\n")
+            return None
+        up = await self.call_tool("rapidwright_unplace_cells", {"cell_names": targets, "unroute": True})
+        logger.info(f"RW unplace result: {up[:200]}")
+        await self.call_tool("rapidwright_write_checkpoint", {"dcp_path": str(stage_out.resolve())})
+        if not stage_out.exists():
+            print("⚠ RapidWright produced no DCP; reverting.\n")
+            await self.call_tool("vivado_open_checkpoint", {"dcp_path": str(self.protected_best_dcp.resolve())})
+            return None
+
+        # Vivado: constrain the unplaced group to the compact pblock, place + route.
+        await self.call_tool("vivado_open_checkpoint", {"dcp_path": str(stage_out.resolve())})
+        pb_cmd = ("catch {delete_pblocks pb_relocate}; create_pblock pb_relocate; "
+                  "set _fh [open {%T} r]; set _cells [read $_fh]; close $_fh; "
+                  "add_cells_to_pblock pb_relocate [get_cells $_cells]; "
+                  "resize_pblock pb_relocate -add %R").replace("%T", str(targets_file.resolve())).replace("%R", prange)
+        await self.call_tool("vivado_run_tcl", {"command": pb_cmd})
+        pr_timeout = int(timeout / 2) if timeout else 1800
+        print(f"Re-placing relocated group (timeout {pr_timeout}s)...")
+        await self.call_tool("vivado_place_design", {"directive": "Default", "timeout": pr_timeout})
+        print(f"Re-routing (timeout {pr_timeout}s)...")
+        await self.call_tool("vivado_route_design", {"directive": "Default", "timeout": pr_timeout})
+        await self.call_tool("vivado_run_tcl", {"command": "catch {delete_pblocks pb_relocate}"})
+
+        route_status = await self.call_tool("vivado_report_route_status", {})
+        fully_routed = ("fully routed" in route_status.lower()) or ("100.00%" in route_status)
+        await self.call_tool("vivado_report_timing_summary", {})
+        try:
+            wns_after = await super().get_wns_for_target_clock(self._call_vivado_tool)
+        except Exception:
+            wns_after = None
+        if wns_after is None and self.best_wns > float('-inf'):
+            wns_after = self.best_wns
+
+        if fully_routed and wns_after is not None and wns_after > self.protected_best_wns:
+            fmax = self.calculate_fmax(wns_after, self.clock_period)
+            fmax_str = f", fmax: {fmax:.2f} MHz" if fmax is not None else ""
+            print(f"✓ RW relocation improved WNS to {wns_after:.3f} ns (was {self.protected_best_wns:.3f} ns"
+                  f"{fmax_str}). Saving as new baseline.\n")
+            await self.call_tool("vivado_write_checkpoint", {"dcp_path": str(output_dcp.resolve()), "force": True})
+            if self.protected_best_dcp is not None:
+                try:
+                    shutil.copy2(output_dcp, self.protected_best_dcp)
+                except Exception as e:
+                    logger.warning(f"Could not update protected baseline copy: {e}")
+            self.protected_best_wns = wns_after
+            if wns_after > self.best_wns:
+                self.best_wns = wns_after
+            return wns_after
+
+        if not fully_routed:
+            reason = "did not route cleanly"
+        elif wns_after is not None:
+            reason = f"WNS {wns_after:.3f} ns did not beat baseline {self.protected_best_wns:.3f} ns"
+        else:
+            reason = "WNS could not be measured"
+        print(f"⚠ RW relocation {reason}; reverting to the protected baseline.")
+        if self.protected_best_dcp is not None and self.protected_best_dcp.exists():
+            await self.call_tool("vivado_open_checkpoint", {"dcp_path": str(self.protected_best_dcp.resolve())})
+            print("✓ Restored protected baseline into Vivado.\n")
+        return None
+
+    @staticmethod
+    def _rapidwright_env(script_dir: Path) -> dict:
+        """Env for the validate_dcps subprocess with JAVA_HOME/RAPIDWRIGHT_PATH guaranteed.
+
+        The RapidWright JVM needs libjvm.so; without JAVA_HOME the validator aborts Phase 1
+        with 'RapidWright not initialized' and reports FAILED with 0 checks -- which would
+        make good stages silently self-revert. We inherit the current env and, only if
+        JAVA_HOME is missing/broken, fall back to Vivado's bundled JRE11 (same as Makefile)."""
+        env = dict(os.environ)
+        env.setdefault("RAPIDWRIGHT_PATH", str(script_dir / "RapidWright"))
+
+        def _valid_jh(jh: str) -> bool:
+            return bool(jh) and (Path(jh) / "lib" / "server" / "libjvm.so").exists()
+
+        if not _valid_jh(env.get("JAVA_HOME", "")):
+            candidates = []
+            # Derive Vivado root from `vivado` on PATH, then its bundled jre11.
+            vivado = shutil.which("vivado")
+            if vivado:
+                vroot = Path(vivado).resolve().parent.parent  # <root>/bin/vivado
+                candidates += sorted(vroot.glob("tps/lnx64/jre11*"))
+                candidates += sorted((vroot.parent).glob("*/tps/lnx64/jre11*"))
+            # Common Xilinx install locations as a last resort.
+            for base in ("/mnt/tools/Xilinx", "/opt/Xilinx", "/tools/Xilinx"):
+                candidates += sorted(Path(base).glob("**/tps/lnx64/jre11*")) if Path(base).exists() else []
+            for c in candidates:
+                if _valid_jh(str(c)):
+                    env["JAVA_HOME"] = str(c)
+                    env["PATH"] = f"{c}/bin:" + env.get("PATH", "")
+                    break
+            else:
+                logger.warning("Could not locate a JRE11 for RapidWright; equivalence gate may fail.")
+        return env
+
     async def _validate_equivalence(self, golden: Path, revised: Path, vectors: int = 100) -> bool:
         """Run validate_dcps.py as a subprocess; True iff 'Overall Result: PASSED'.
         Gates netlist-editing stages (retiming) before adoption so we never keep a
@@ -1590,9 +1860,10 @@ set fh [open {%RESULT%} w]; puts $fh $r; close $fh
             py = Path(sys.executable)
         cmd = [str(py), str(script_dir / "validate_dcps.py"),
                str(golden.resolve()), str(revised.resolve()), "--vectors", str(vectors)]
+        env = self._rapidwright_env(script_dir)
         try:
             proc = await asyncio.create_subprocess_exec(
-                *cmd, cwd=str(script_dir),
+                *cmd, cwd=str(script_dir), env=env,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
             out, _ = await proc.communicate()
             text = out.decode(errors="replace")
@@ -1671,6 +1942,113 @@ set fh [open {%RESULT%} w]; puts $fh $r; close $fh
               f"(was {self.protected_best_wns:.3f} ns{fmax_str}). Saving as new baseline.\n")
         await self.call_tool("vivado_write_checkpoint", {
             "dcp_path": str(output_dcp.resolve()), "force": True})
+        try:
+            shutil.copy2(output_dcp, self.protected_best_dcp)
+        except Exception as e:
+            logger.warning(f"Could not update protected baseline copy: {e}")
+        self.protected_best_wns = wns_after
+        if wns_after > self.best_wns:
+            self.best_wns = wns_after
+        return wns_after
+
+    async def run_reimpl_baseline(self, output_dcp: Path, timeout: Optional[int] = None) -> Optional[float]:
+        """Fresh aggressive re-implementation -- the FINAL FALLBACK stage.
+
+        Instead of incrementally polishing the contest's given placement (what every other
+        stage does), this RE-SOLVES the design from scratch: reload the golden netlist,
+        unplace everything, then place/phys_opt/route with strong timing directives. On
+        route-dominated designs this recovers far more than incremental relocation because
+        the given placement is often mediocre. (Proven 2026-07-19 on rosetta: WNS
+        -1.078 -> -0.887, +21.8 MHz vs +10.6 for the incremental flow, VALIDATED PASS.)
+
+        It runs LAST and is adopted ONLY if it beats the protected best from the upstream
+        steps AND passes the equivalence gate (phys_opt edits the netlist, so we validate
+        like retime). If the incremental steps already did better, re-impl self-reverts.
+        This makes it a strict, safe "final hit": it can only help, never hurt."""
+        print("\n=== Deterministic Pre-LLM Optimization: fresh re-implementation (final fallback) ===\n")
+        if getattr(self, "reimpl_mode", "always") == "never":
+            print("re-impl disabled (--reimpl-mode never). Skipping.\n")
+            return None
+        if self._golden_input is None or not Path(self._golden_input).exists():
+            print("No golden input available to re-solve; skipping re-impl.\n")
+            return None
+
+        budget = int(timeout) if timeout else 2400
+        place_dir = getattr(self, "reimpl_place_directive", "ExtraTimingOpt") or "ExtraTimingOpt"
+        route_dir = getattr(self, "reimpl_route_directive", "AggressiveExplore") or "AggressiveExplore"
+        # Split the stage budget across the sub-steps (place-heavy, route-heavy).
+        t_place = max(300, int(budget * 0.40))
+        t_physa = max(120, int(budget * 0.15))
+        t_route = max(300, int(budget * 0.35))
+        t_physb = max(120, int(budget * 0.10))
+
+        print(f"Re-solving from golden netlist: {Path(self._golden_input).name}")
+        print(f"  place='{place_dir}' route='{route_dir}'  budget {budget}s "
+              f"(place {t_place}s / physopt {t_physa}s / route {t_route}s / physopt {t_physb}s)")
+        try:
+            await self.call_tool("vivado_open_checkpoint", {
+                "dcp_path": str(Path(self._golden_input).resolve())})
+            print("  unplace + place_design ...")
+            await self.call_tool("vivado_run_tcl", {"command": "place_design -unplace", "timeout": 300})
+            await self.call_tool("vivado_run_tcl", {
+                "command": f"place_design -directive {place_dir}", "timeout": t_place})
+            print("  phys_opt_design (pre-route) ...")
+            await self.call_tool("vivado_run_tcl", {
+                "command": "phys_opt_design -directive AggressiveExplore", "timeout": t_physa})
+            print("  route_design ...")
+            await self.call_tool("vivado_run_tcl", {
+                "command": f"route_design -directive {route_dir}", "timeout": t_route})
+            print("  phys_opt_design (post-route) ...")
+            await self.call_tool("vivado_run_tcl", {
+                "command": "phys_opt_design", "timeout": t_physb})
+        except Exception as e:
+            logger.exception(f"re-impl flow errored: {e}")
+            print(f"⚠ re-impl flow errored ({e}); reverting to protected baseline.\n")
+            if self.protected_best_dcp and self.protected_best_dcp.exists():
+                await self.call_tool("vivado_open_checkpoint", {
+                    "dcp_path": str(self.protected_best_dcp.resolve())})
+            return None
+
+        await self.call_tool("vivado_report_timing_summary", {})
+        try:
+            wns_after = await super().get_wns_for_target_clock(self._call_vivado_tool)
+        except Exception:
+            wns_after = None
+
+        baseline = self.protected_best_wns if self.protected_best_wns > float('-inf') else self.best_wns
+        if wns_after is None or (baseline > float('-inf') and wns_after <= baseline):
+            cur = f"{wns_after:.3f} ns" if wns_after is not None else "unmeasurable"
+            base_s = f"{baseline:.3f} ns" if baseline > float('-inf') else "n/a"
+            print(f"⚠ re-impl ({cur}) did not beat the upstream best ({base_s}); reverting.")
+            if self.protected_best_dcp and self.protected_best_dcp.exists():
+                await self.call_tool("vivado_open_checkpoint", {
+                    "dcp_path": str(self.protected_best_dcp.resolve())})
+                print("✓ Restored protected baseline into Vivado.\n")
+            return None
+
+        # Beat the upstream best -> gate on equivalence before adopting (phys_opt edits netlist).
+        cand = Path(self.temp_dir) / "reimpl_candidate.dcp"
+        await self.call_tool("vivado_write_checkpoint", {
+            "dcp_path": str(cand.resolve()), "force": True})
+        base_s = f"{baseline:.3f} ns" if baseline > float('-inf') else "n/a"
+        print(f"Re-impl improved WNS to {wns_after:.3f} ns (upstream best {base_s}); "
+              f"running equivalence check before adopting...")
+        equiv = await self._validate_equivalence(Path(self._golden_input), cand, vectors=100)
+        if not equiv:
+            print("⚠ re-impl FAILED the equivalence check; reverting to protected baseline.\n")
+            if self.protected_best_dcp and self.protected_best_dcp.exists():
+                await self.call_tool("vivado_open_checkpoint", {
+                    "dcp_path": str(self.protected_best_dcp.resolve())})
+            return None
+
+        fmax = self.calculate_fmax(wns_after, self.clock_period)
+        fmax_str = f", fmax: {fmax:.2f} MHz" if fmax is not None else ""
+        print(f"✓ re-impl improved WNS to {wns_after:.3f} ns AND passed equivalence "
+              f"(upstream best {base_s}{fmax_str}). Saving as new baseline.\n")
+        await self.call_tool("vivado_write_checkpoint", {
+            "dcp_path": str(output_dcp.resolve()), "force": True})
+        if self.protected_best_dcp is None:
+            self.protected_best_dcp = self.run_dir / "best_protected.dcp"
         try:
             shutil.copy2(output_dcp, self.protected_best_dcp)
         except Exception as e:
@@ -1889,7 +2267,7 @@ set fh [open {%RESULT%} w]; puts $fh $r; close $fh
         # so a single place/route on a huge design cannot blow the 1-hour limit.
         # Phased budgets: phys_opt gets its own phase; pblock + cell_replace SHARE the
         # "manual" phase budget (so both fit in the middle 20-min slot, per the plan).
-        MANUAL_STEPS = {"relocate", "pblock", "cell_replace"}
+        MANUAL_STEPS = {"relocate", "relocate_rw", "pblock", "cell_replace"}
         manual_deadline = None  # elapsed-time deadline for the shared manual phase
         for step in self.pre_opt_steps:
             remaining = self._remaining_total()
@@ -1904,6 +2282,8 @@ set fh [open {%RESULT%} w]; puts $fh $r; close $fh
                     print(f"⏱ Manual-opt phase budget exhausted; skipping '{step}'.\n")
                     continue
                 budget = int(min(manual_left, remaining - 30))
+            elif step == "reimpl":  # final fallback: its own (larger) dedicated budget
+                budget = int(min(self.reimpl_timeout, remaining - 30))
             else:  # phys_opt (and any future dedicated-phase step)
                 budget = int(min(self.phys_opt_timeout, remaining - 30))
             print(f"⏱ Stage '{step}': budget {budget}s (overall {remaining:.0f}s left of {self.total_timeout}s)")
@@ -1912,12 +2292,16 @@ set fh [open {%RESULT%} w]; puts $fh $r; close $fh
                     await self.run_physopt_baseline(output_dcp, timeout=budget)
                 elif step == "relocate":
                     await self.run_relocate_baseline(output_dcp, timeout=budget)
+                elif step == "relocate_rw":
+                    await self.run_relocate_rw_baseline(output_dcp, timeout=budget)
                 elif step == "retime":
                     await self.run_retime_baseline(output_dcp, timeout=budget)
                 elif step == "pblock":
                     await self.run_pblock_baseline(output_dcp, timeout=budget)
                 elif step == "cell_replace":
                     await self.run_cell_replacement_baseline(output_dcp, timeout=budget)
+                elif step == "reimpl":
+                    await self.run_reimpl_baseline(output_dcp, timeout=budget)
                 else:
                     logger.warning(f"Unknown pre-opt step '{step}', skipping")
             except Exception as e:
@@ -3576,10 +3960,12 @@ Examples:
     parser.add_argument(
         "--pre-opt",
         type=str,
-        default="phys_opt,relocate,retime,pblock,cell_replace",
+        default="phys_opt,relocate,retime,pblock,cell_replace,reimpl",
         help="Comma-separated deterministic steps to run (in order) before the LLM stage. "
-             "Supported: phys_opt, relocate, retime, pblock, cell_replace, none. "
-             "Default: 'phys_opt,relocate,retime,pblock,cell_replace'."
+             "Supported: phys_opt, relocate, retime, pblock, cell_replace, reimpl, relocate_rw, none. "
+             "'reimpl' (fresh from-scratch place/route) runs LAST as a final fallback and is kept only "
+             "if it beats the incremental steps. "
+             "Default: 'phys_opt,relocate,retime,pblock,cell_replace,reimpl'."
     )
     parser.add_argument(
         "--physopt-directive",
@@ -3608,6 +3994,17 @@ Examples:
                              "across logic to shorten logic-depth-bound paths, latency-preserving. "
                              "Gated by an in-stage equivalence check; adopts only if timing improves "
                              "AND equivalence passes. always = attempt (default), never = skip.")
+    parser.add_argument("--reimpl-mode", choices=["auto", "always", "never"], default="always",
+                        help="Fresh re-implementation fallback stage: re-solve the design from scratch "
+                             "(unplace + strong-directive place/phys_opt/route). Runs LAST; adopts only if it "
+                             "beats the incremental steps AND passes the equivalence gate. always = attempt "
+                             "(default), never = skip.")
+    parser.add_argument("--reimpl-place-directive", type=str, default="ExtraTimingOpt",
+                        help="place_design directive for the re-impl stage (default: ExtraTimingOpt)")
+    parser.add_argument("--reimpl-route-directive", type=str, default="AggressiveExplore",
+                        help="route_design directive for the re-impl stage (default: AggressiveExplore)")
+    parser.add_argument("--reimpl-timeout", type=int, default=2400,
+                        help="Wall-clock budget (s) for the re-impl fallback stage (default: 2400 = 40 min)")
     parser.add_argument("--phys-opt-timeout", type=int, default=1200,
                         help="Wall-clock budget (s) for the phys_opt stage (default: 1200 = 20 min)")
     parser.add_argument("--manual-timeout", type=int, default=1200,
@@ -3688,7 +4085,7 @@ Examples:
     print(f"Output:      {args.output_dcp.resolve()}")
     print(f"Run dir:     {run_dir}")
     print(f"Model:       {args.model}")
-    print(f"Pre-opt:     {args.pre_opt}" + (f" (physopt directive={args.physopt_directive})" if args.physopt_directive else "") + f" [relocate={args.relocate_mode}, retime={args.retime_mode}, pblock={args.pblock_mode}, cell_replace={args.cell_replace_mode}]")
+    print(f"Pre-opt:     {args.pre_opt}" + (f" (physopt directive={args.physopt_directive})" if args.physopt_directive else "") + f" [relocate={args.relocate_mode}, retime={args.retime_mode}, pblock={args.pblock_mode}, cell_replace={args.cell_replace_mode}, reimpl={args.reimpl_mode}]")
     print(f"LLM stage:   {'DISABLED (--skip-llm)' if args.skip_llm else 'enabled'}")
     print(f"Budgets:     phys_opt {args.phys_opt_timeout}s | manual(pblock+cell) {args.manual_timeout}s | LLM {args.llm_timeout}s | total {args.total_timeout}s | cost ${args.cost_cap:.2f}")
     print()
@@ -3704,9 +4101,13 @@ Examples:
         cell_replace_mode=args.cell_replace_mode,
         relocate_mode=args.relocate_mode,
         retime_mode=args.retime_mode,
+        reimpl_mode=args.reimpl_mode,
+        reimpl_place_directive=args.reimpl_place_directive,
+        reimpl_route_directive=args.reimpl_route_directive,
         skip_llm=args.skip_llm,
         phys_opt_timeout=args.phys_opt_timeout,
         manual_timeout=args.manual_timeout,
+        reimpl_timeout=args.reimpl_timeout,
         llm_timeout=args.llm_timeout,
         total_timeout=args.total_timeout,
         cost_cap=args.cost_cap

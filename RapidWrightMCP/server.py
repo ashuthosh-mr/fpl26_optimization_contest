@@ -411,6 +411,32 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["cell_names"]
             }
+        ),
+        Tool(
+            name="unplace_cells",
+            description="""Unplace a GROUP of cells (and unroute their nets) using RapidWright's
+            native fullyUnplaceCell + Net.unroute. Unlike Vivado's unplace_cell, this does NOT
+            fail with 'routing contention at pips' on a routed design, so it can be applied
+            iteratively. After running, write the checkpoint and let Vivado re-place the cells
+            (e.g. under a pblock) and route_design. Placement/routing-only -> equivalent.
+
+            Must be called AFTER read_checkpoint.""",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "cell_names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "List of cell names to unplace"
+                    },
+                    "unroute": {
+                        "type": "boolean",
+                        "description": "Also unroute the cells' connected nets (default: true)",
+                        "default": True
+                    }
+                },
+                "required": ["cell_names"]
+            }
         )
     ]
 
@@ -519,7 +545,13 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 cell_names=arguments["cell_names"],
                 max_candidates=arguments.get("max_candidates", 10)
             )
-        
+
+        elif name == "unplace_cells":
+            result = rw.unplace_cells(
+                cell_names=arguments["cell_names"],
+                unroute=arguments.get("unroute", True)
+            )
+
         else:
             result = {"error": f"Unknown tool: {name}"}
         

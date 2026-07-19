@@ -9,6 +9,8 @@ A deterministic optimization pipeline has ALREADY run on this design before you:
      logic-depth-bound paths, latency-preserving; kept only if it still validates)
   4. pblock-based re-placement (consolidating the design into a contiguous region)
   5. targeted cell re-placement (moving high-detour critical cells)
+  6. fresh re-implementation fallback (a full from-scratch unplace + strong-directive
+     place/phys_opt/route; kept only if it beat all the incremental steps above)
 The BEST result so far is ALREADY SAVED to the output DCP. Its current WNS is given in the
 message below. Vivado has that best design OPEN and RapidWright has it LOADED - both in memory.
 
@@ -17,8 +19,9 @@ Find ADDITIONAL, TARGETED changes that BEAT the current best WNS. You are a fini
 from-scratch optimizer.
 
 DO NOT:
-- Do NOT re-run default phys_opt_design, full pblock re-placement, or whole-design cell
-  re-placement - they already ran and repeating them wastes budget and can regress the result.
+- Do NOT re-run default phys_opt_design, full pblock re-placement, whole-design cell
+  re-placement, or a full from-scratch re-implementation (place_design -unplace / global
+  re-place+route) - they already ran and repeating them wastes budget and can regress the result.
 - Do NOT re-open the input DCP in Vivado or reload it in RapidWright - both are already loaded.
 - Do NOT write_checkpoint unless the CURRENT measured WNS beats the best so far.
 

@@ -1762,6 +1762,68 @@ def optimize_cell_placement(
         return {"error": str(e)}
 
 
+def unplace_cells(cell_names: list, unroute: bool = True) -> Dict[str, Any]:
+    """
+    Unplace a GROUP of cells (and optionally unroute their nets) using RapidWright's
+    native DesignTools.fullyUnplaceCell + Net.unroute.
+
+    Unlike Vivado's unplace_cell, this does NOT fail with "routing contention at pips"
+    on an already-routed design, so it can be applied ITERATIVELY (pass after pass).
+    After running, write the checkpoint and let Vivado re-place the cells (e.g. under a
+    pblock, timing-driven) and route_design. Placement/routing-only: the netlist is
+    unchanged -> functionally equivalent.
+
+    Args:
+        cell_names: cells to unplace
+        unroute: also unroute the cells' connected nets (default True)
+    Returns:
+        dict with counts of unplaced cells and unrouted nets
+    """
+    if not _initialized:
+        return {"error": "RapidWright not initialized. Call initialize_rapidwright first."}
+    if _current_design is None:
+        return {"error": "No design loaded. Use read_checkpoint first."}
+    try:
+        from com.xilinx.rapidwright.design import DesignTools
+
+        design = _current_design
+        unplaced = 0
+        missing = 0
+        unrouted_nets = set()
+        for cell_name in cell_names:
+            cell = design.getCell(cell_name)
+            if cell is None:
+                missing += 1
+                continue
+            if unroute:
+                for net in _get_cell_physical_nets(design, cell):
+                    try:
+                        net.unroute()
+                        unrouted_nets.add(str(net.getName()))
+                    except Exception:
+                        pass
+            try:
+                DesignTools.fullyUnplaceCell(cell, None)
+                unplaced += 1
+            except Exception as e:
+                logger.warning(f"Could not unplace {cell_name}: {e}")
+        return {
+            "status": "success",
+            "requested": len(cell_names),
+            "unplaced": unplaced,
+            "missing": missing,
+            "unrouted_nets": len(unrouted_nets),
+            "message": (f"Unplaced {unplaced}/{len(cell_names)} cells, unrouted "
+                        f"{len(unrouted_nets)} nets. Re-place under a pblock and "
+                        "route_design in Vivado."),
+        }
+    except Exception as e:
+        logger.error(f"Error in unplace_cells: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"error": str(e)}
+
+
 def convert_fabric_region_to_pblock_ranges(
     col_min: int,
     col_max: int,
