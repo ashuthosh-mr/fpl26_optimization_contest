@@ -1386,29 +1386,60 @@ class DCPOptimizer(DCPOptimizerBase):
                 pass
         tcl_body = r'''
 proc _sitetype {cell} { set s [get_sites -quiet -of_objects $cell]; if {$s eq ""} {return ""}; return [get_property SITE_TYPE $s] }
-proc do_relocate_plan {hard_re} {
-    set p [lindex [get_timing_paths -max_paths 1 -nworst 1 -delay_type max] 0]
-    if {$p eq ""} { return "SKIP no_path" }
-    set slack [get_property SLACK $p]
-    if {$slack >= 0} { return "SKIP timing_met" }
-    set scell [get_cells -quiet -of_objects [get_pins -quiet [get_property STARTPOINT_PIN $p]]]
-    set ecell [get_cells -quiet -of_objects [get_pins -quiet [get_property ENDPOINT_PIN $p]]]
-    if {$scell eq "" || $ecell eq ""} { return "SKIP no_endpoints" }
-    set stype [_sitetype $scell]; set etype [_sitetype $ecell]
-    if {[regexp $hard_re $stype] && ![regexp $hard_re $etype]} {
-        set anchor $scell; set mov $ecell
-    } elseif {[regexp $hard_re $etype] && ![regexp $hard_re $stype]} {
-        set anchor $ecell; set mov $scell
-    } else {
-        return "SKIP no_hard_anchor(s=$stype,e=$etype)"
+proc _tile {cell} { return [get_tiles -quiet -of_objects [get_sites -quiet -of_objects $cell]] }
+# Compact SLICE pblock range holding ~ncells, made of the slices CLOSEST to (acol,arow)
+# in clock region cr. Hugging the target minimizes wire length (recovers more delay
+# than a loose box). Returns "" if too few slices.
+proc _compact_range {cr acol arow ncells} {
+    # Capacity: ~ncells cells, FFs pack 16/slice; x4 headroom for occupied slices.
+    set need [expr {int(ceil($ncells/8.0))*4}]
+    if {$need < 16} { set need 16 }
+    # Collect this clock region's slices with tile coords + SLICE X/Y indices.
+    set slices {}
+    foreach s [get_sites -quiet -of_objects $cr -filter {SITE_TYPE =~ SLICE*}] {
+        set t [get_tiles -of_objects $s]
+        regexp {SLICE_X(\d+)Y(\d+)} $s -> xx yy
+        lappend slices [list [get_property COLUMN $t] [get_property ROW $t] $xx $yy]
     }
-    set at [get_tiles -of_objects [get_sites -of_objects $anchor]]
-    set mt [get_tiles -of_objects [get_sites -of_objects $mov]]
+    if {[llength $slices] < 4} { return "" }
+    # Rank SLICE columns by tile-col distance to the target; keep the 2 nearest.
+    # A 2-column band is the empirical sweet spot: 1 col over-congests, wide boxes let
+    # cells drift from the anchor -- both cost delay.
+    set coldist [dict create]
+    foreach e $slices { set x [lindex $e 2]; set d [expr {abs([lindex $e 0]-$acol)}]
+        if {![dict exists $coldist $x] || $d < [dict get $coldist $x]} { dict set coldist $x $d } }
+    set collist {}
+    dict for {x d} $coldist { lappend collist [list $d $x] }
+    set keepx {}
+    foreach pair [lrange [lsort -integer -index 0 $collist] 0 1] { lappend keepx [lindex $pair 1] }
+    # Within the kept columns, take the rows nearest the target row, up to capacity.
+    set inband {}
+    foreach e $slices {
+        if {[lsearch $keepx [lindex $e 2]] >= 0} { lappend inband [list [expr {abs([lindex $e 1]-$arow)}] [lindex $e 2] [lindex $e 3]] }
+    }
+    set take [lrange [lsort -integer -index 0 $inband] 0 [expr {$need-1}]]
+    if {[llength $take] < 4} { return "" }
+    set xs {}; set ys {}
+    foreach e $take { lappend xs [lindex $e 1]; lappend ys [lindex $e 2] }
+    set xmin [lindex [lsort -integer $xs] 0]; set xmax [lindex [lsort -integer $xs] end]
+    set ymin [lindex [lsort -integer $ys] 0]; set ymax [lindex [lsort -integer $ys] end]
+    return "SLICE_X${xmin}Y${ymin}:SLICE_X${xmax}Y${ymax}"
+}
+proc _apply {targets range label slack} {
+    catch {delete_pblocks pb_relocate}
+    create_pblock pb_relocate
+    add_cells_to_pblock pb_relocate $targets
+    resize_pblock pb_relocate -add $range
+    unplace_cell $targets
+    return "PLAN ok $label ncells=[llength $targets] range=$range slack=$slack"
+}
+# Case A: worst path runs between a FIXED hard macro and a distant register bank.
+# Pull the bank (bus + feeder LUTs) tight against the anchor.
+proc _plan_anchor {anchor mov hard_re slack} {
+    set at [_tile $anchor]; set mt [_tile $mov]
     set dist [expr {abs([get_property COLUMN $at]-[get_property COLUMN $mt])+abs([get_property ROW $at]-[get_property ROW $mt])}]
     if {$dist < 6} { return "SKIP anchor_already_close_dist_$dist" }
-    set movname [get_property NAME $mov]
-    set base $movname
-    regsub {\[\d+\]$} $movname {} base
+    set base [get_property NAME $mov]; regsub {\[\d+\]$} $base {} base
     set pat $base ; append pat {[*]}
     set ffs [get_cells -quiet $pat]
     if {[llength $ffs] == 0} { set ffs $mov }
@@ -1419,24 +1450,62 @@ proc do_relocate_plan {hard_re} {
     set targets [get_cells -quiet [lsort -unique [concat [get_property NAME $ffs] $luts]]]
     if {[llength $targets] == 0} { return "SKIP no_targets" }
     if {[llength $targets] > 400} { return "SKIP too_many_cells_[llength $targets]" }
-    set asite [get_sites -of_objects $anchor]
-    set acol [get_property COLUMN $at]; set arow [get_property ROW $at]
-    set cr [get_clock_regions -of_objects $asite]
-    set xs {}; set ys {}
-    foreach s [get_sites -quiet -of_objects $cr -filter {SITE_TYPE =~ SLICE*}] {
-        set t [get_tiles -of_objects $s]; set c [get_property COLUMN $t]; set r [get_property ROW $t]
-        if {$c >= $acol-8 && $c <= $acol+8 && abs($r-$arow) <= 20} { regexp {SLICE_X(\d+)Y(\d+)} $s -> xx yy; lappend xs $xx; lappend ys $yy }
+    set cr [get_clock_regions -of_objects [get_sites -of_objects $anchor]]
+    set range [_compact_range $cr [get_property COLUMN $at] [get_property ROW $at] [llength $targets]]
+    if {$range eq ""} { return "SKIP no_slices_near_anchor" }
+    return [_apply $targets $range "anchor=[get_property NAME $anchor] dist=$dist" $slack]
+}
+# Case B: no hard anchor (FF -> logic cone -> FF). The top paths share one spread-out
+# cone; consolidate ALL its SLICE cells into a compact region around their centroid.
+proc _plan_cone {hard_re slack} {
+    set paths [get_timing_paths -max_paths 12 -nworst 3 -delay_type max]
+    set names {}
+    foreach p $paths {
+        foreach c [get_cells -quiet -of_objects [get_pins -quiet -of_objects $p]] {
+            set st [_sitetype $c]
+            if {[regexp {SLICE} $st] && ![regexp $hard_re $st]} { lappend names [get_property NAME $c] }
+        }
     }
-    if {[llength $xs] < 4} { return "SKIP no_slices_near_anchor" }
-    set xmin [lindex [lsort -integer $xs] 0]; set xmax [lindex [lsort -integer $xs] end]
-    set ymin [lindex [lsort -integer $ys] 0]; set ymax [lindex [lsort -integer $ys] end]
-    set range "SLICE_X${xmin}Y${ymin}:SLICE_X${xmax}Y${ymax}"
-    catch {delete_pblocks pb_relocate}
-    create_pblock pb_relocate
-    add_cells_to_pblock pb_relocate $targets
-    resize_pblock pb_relocate -add $range
-    unplace_cell $targets
-    return "PLAN ok anchor=[get_property NAME $anchor] ncells=[llength $targets] dist=$dist range=$range slack=$slack"
+    set targets [get_cells -quiet [lsort -unique $names]]
+    if {[llength $targets] < 4} { return "SKIP cone_too_small_[llength $targets]" }
+    if {[llength $targets] > 600} { return "SKIP cone_too_large_[llength $targets]" }
+    set sc 0; set sr 0; set n 0; set cols {}; set rows {}; set crcount [dict create]
+    foreach c $targets {
+        set t [_tile $c]
+        if {$t ne ""} {
+            set cc [get_property COLUMN $t]; set rr [get_property ROW $t]
+            set sc [expr {$sc+$cc}]; set sr [expr {$sr+$rr}]; incr n
+            lappend cols $cc; lappend rows $rr
+            set creg [get_clock_regions -quiet -of_objects [get_sites -quiet -of_objects $c]]
+            if {$creg ne ""} { dict incr crcount $creg }
+        }
+    }
+    if {$n == 0} { return "SKIP cone_unplaced" }
+    set spread [expr {([lindex [lsort -integer $cols] end]-[lindex [lsort -integer $cols] 0])+([lindex [lsort -integer $rows] end]-[lindex [lsort -integer $rows] 0])}]
+    if {$spread < 12} { return "SKIP cone_already_compact_spread_$spread" }
+    set cr ""; set best 0
+    dict for {k v} $crcount { if {$v > $best} { set best $v; set cr $k } }
+    if {$cr eq ""} { return "SKIP cone_no_region" }
+    set range [_compact_range $cr [expr {$sc/$n}] [expr {$sr/$n}] [llength $targets]]
+    if {$range eq ""} { return "SKIP no_slices_for_cone" }
+    return [_apply $targets $range "cone spread=$spread region=$cr" $slack]
+}
+proc do_relocate_plan {hard_re} {
+    set p [lindex [get_timing_paths -max_paths 1 -nworst 1 -delay_type max] 0]
+    if {$p eq ""} { return "SKIP no_path" }
+    set slack [get_property SLACK $p]
+    if {$slack >= 0} { return "SKIP timing_met" }
+    set scell [get_cells -quiet -of_objects [get_pins -quiet [get_property STARTPOINT_PIN $p]]]
+    set ecell [get_cells -quiet -of_objects [get_pins -quiet [get_property ENDPOINT_PIN $p]]]
+    if {$scell eq "" || $ecell eq ""} { return "SKIP no_endpoints" }
+    set stype [_sitetype $scell]; set etype [_sitetype $ecell]
+    if {[regexp $hard_re $stype] && ![regexp $hard_re $etype]} {
+        return [_plan_anchor $scell $ecell $hard_re $slack]
+    } elseif {[regexp $hard_re $etype] && ![regexp $hard_re $stype]} {
+        return [_plan_anchor $ecell $scell $hard_re $slack]
+    } else {
+        return [_plan_cone $hard_re $slack]
+    }
 }
 if {[catch {do_relocate_plan {%HARD%}} r]} { set r "SKIP tcl_error:$r" }
 set fh [open {%RESULT%} w]; puts $fh $r; close $fh
