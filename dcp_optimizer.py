@@ -2009,6 +2009,17 @@ set fh [open {%RESULT%} w]; puts $fh $r; close $fh
                     "dcp_path": str(self.protected_best_dcp.resolve())})
             return None
 
+        # Route-status gate: a not-fully-routed design reports optimistic WNS (missing
+        # route delays). Never adopt/compare on such a reading -- treat it as a failure.
+        route_status = await self.call_tool("vivado_report_route_status", {})
+        fully_routed = ("fully routed" in route_status.lower()) or ("100.00%" in route_status)
+        if not fully_routed:
+            print("⚠ re-impl did not route cleanly; reverting to protected baseline.\n")
+            if self.protected_best_dcp and self.protected_best_dcp.exists():
+                await self.call_tool("vivado_open_checkpoint", {
+                    "dcp_path": str(self.protected_best_dcp.resolve())})
+            return None
+
         await self.call_tool("vivado_report_timing_summary", {})
         try:
             wns_after = await super().get_wns_for_target_clock(self._call_vivado_tool)
@@ -2307,8 +2318,8 @@ set fh [open {%RESULT%} w]; puts $fh $r; close $fh
             except Exception as e:
                 logger.exception(f"Pre-opt step '{step}' failed: {e}")
                 print(f"⚠ Pre-opt step '{step}' failed, continuing: {e}\n")
-            if self.best_wns >= 0:
-                break  # timing already met; no need for further pre-opt
+            if self.protected_best_wns >= 0:
+                break  # timing met on the SAVED (routed) design; no need for further pre-opt
 
         # WNS of the best deterministic result so far (for the LLM status note).
         baseline_wns = (self.protected_best_wns
@@ -2316,7 +2327,7 @@ set fh [open {%RESULT%} w]; puts $fh $r; close $fh
                         else None)
 
         # If timing is now met, or the LLM stage is disabled, stop here.
-        if self.best_wns >= 0:
+        if self.protected_best_wns >= 0:
             print("✓ Timing met after deterministic optimization! No LLM stage needed.\n")
             self.end_time = time.time()
             self._print_optimization_summary()
@@ -2495,7 +2506,15 @@ Proceed with optimization strategy based on the analysis above. Do NOT reload th
             total_runtime = (self.end_time or time.time()) - self.start_time
             print(f"\nTOTAL RUNTIME: {total_runtime:.2f} seconds ({total_runtime/60:.2f} minutes)")
         
-        best_wns = self.best_wns if self.best_wns > float('-inf') else None
+        # Report the WNS of the design ACTUALLY SAVED (protected best = fully-routed,
+        # adopted result), NOT the optimistic self.best_wns which the generic call_tool
+        # wrapper updates on every timing read including not-fully-routed intermediates.
+        if self.protected_best_wns > float('-inf'):
+            best_wns = self.protected_best_wns
+        elif self.best_wns > float('-inf'):
+            best_wns = self.best_wns
+        else:
+            best_wns = None
         result_lines = self._format_fmax_results(
             self.clock_period, self.initial_wns, best_wns, result_label="Best"
         )
