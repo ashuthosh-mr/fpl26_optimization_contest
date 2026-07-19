@@ -1433,6 +1433,13 @@ proc _apply {targets range label slack} {
     create_pblock pb_relocate
     add_cells_to_pblock pb_relocate $targets
     resize_pblock pb_relocate -add $range
+    # Clear fixed flags and unroute the targets' nets first, so unplace_cell cannot fail
+    # with "Cannot unplace / routing contention" on an already-routed design (this bites
+    # 2nd+ iterations). All placement/routing-only -> functionally equivalent.
+    catch {set_property IS_BEL_FIXED 0 $targets}
+    catch {set_property IS_LOC_FIXED 0 $targets}
+    set tnets [get_nets -quiet -of_objects $targets]
+    if {$tnets ne ""} { catch {route_design -unroute -nets $tnets} }
     unplace_cell $targets
     return "PLAN ok $label ncells=[llength $targets] range=$range slack=$slack"
 }
