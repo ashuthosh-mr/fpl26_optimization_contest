@@ -400,70 +400,27 @@ async def main():
                 f"{cell}"
             )
         import json
-        interesting_cells = [
-            "dataCache_1/ways_0_tags_reg_i_21",
-            "dataCache_1/ways_0_tags_reg_i_22",
-            "dataCache_1/ways_0_tags_reg_i_23",
-            "dataCache_1/stageA_mask[3]_i_1",
-            "dataCache_1/decode_to_execute_ENV_CTRL[0]_i_1",
-            "dataCache_1/dBus_cmd_valid_INST_0_i_2",
+
+        # ------------------------------------------------------------------
+        # STEP 3 (updated): target the exact cells from the posted path.
+        # This keeps the flow focused on the logic that is currently being
+        # pulled into the X3Y0 region instead of staying near the intended
+        # X4Y0/X11Y13-style critical path neighborhood.
+        # ------------------------------------------------------------------
+        critical_path_cells = [
+            "memory_to_writeBack_MUL_LOW_reg[43]",
+            "dataCache_1/HazardSimplePlugin_writeBackBuffer_payload_data[14]_i_7",
+            "dataCache_1/HazardSimplePlugin_writeBackBuffer_payload_data_reg[14]_i_2",
+            "dataCache_1/HazardSimplePlugin_writeBackBuffer_payload_data_reg[22]_i_2",
+            "dataCache_1/HazardSimplePlugin_writeBackBuffer_payload_data[18]_i_1",
+            "dataCache_1/RegFilePlugin_regFile_reg_r1_0_31_14_27_i_6",
+            "RegFilePlugin_regFile_reg_r2_0_31_14_27",
         ]
 
         print("\n" + "="*80)
-        print("HOTSPOT CELL LOCATION INVESTIGATION")
+        print("CRITICAL PATH CELL INVESTIGATION")
         print("="*80)
-        for cell in interesting_cells:
-
-            result = await tester.call_rapidwright_tool(
-                "search_cells",
-                {
-                    "pattern": cell
-                }
-            )
-
-            try:
-                data = json.loads(result)
-
-                print("\n" + "-"*60)
-                print(cell)
-
-                for match in data[:5]:
-                    print(match)
-            except Exception:
-                print(result[:1000])            
-
-        interesting_cells = [
-            # Worst spread hotspot
-            "memory_to_writeBack_MUL_LOW_reg[35]",
-            "dataCache_1/HazardSimplePlugin_writeBackBuffer_payload_data[6]_i_7",
-
-            # Neighboring MUL bits
-            "memory_to_writeBack_MUL_LOW_reg[30]",
-            "memory_to_writeBack_MUL_LOW_reg[31]",
-            "memory_to_writeBack_MUL_LOW_reg[32]",
-            "memory_to_writeBack_MUL_LOW_reg[33]",
-            "memory_to_writeBack_MUL_LOW_reg[34]",
-            "memory_to_writeBack_MUL_LOW_reg[35]",
-            "memory_to_writeBack_MUL_LOW_reg[36]",
-            "memory_to_writeBack_MUL_LOW_reg[37]",
-            "memory_to_writeBack_MUL_LOW_reg[38]",
-            "memory_to_writeBack_MUL_LOW_reg[39]",
-            # Neighboring payload bits
-            "dataCache_1/HazardSimplePlugin_writeBackBuffer_payload_data[5]_i_7",
-            "dataCache_1/HazardSimplePlugin_writeBackBuffer_payload_data[7]_i_7",
-            "dataCache_1/HazardSimplePlugin_writeBackBuffer_payload_data[8]_i_7",
-
-            # Cells later in the same critical path
-            "dataCache_1/HazardSimplePlugin_writeBackBuffer_payload_data[31]_i_1",
-            "dataCache_1/RegFilePlugin_regFile_reg_r1_0_31_28_31_i_3",
-        ]
-
-        print("\n" + "="*80)
-        print("SPREAD HOTSPOT INVESTIGATION")
-        print("="*80)
-
-        for cell in interesting_cells:
-
+        for cell in critical_path_cells:
             result = await tester.call_rapidwright_tool(
                 "search_cells",
                 {
@@ -478,9 +435,7 @@ async def main():
         result = await tester.call_rapidwright_tool(
             "optimize_cell_placement",
             {
-                "cell_names": [
-                    "dataCache_1/RegFilePlugin_regFile_reg_r1_0_31_28_31_i_3"
-                ]
+                "cell_names": critical_path_cells
             }
         )
 

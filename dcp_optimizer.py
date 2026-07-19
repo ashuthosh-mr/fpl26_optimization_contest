@@ -158,6 +158,9 @@ class DCPOptimizerBase:
         self.high_fanout_nets = []
         self.clock_period = None
         self.target_clock = None  # Set to clock name (e.g. "clk_fpl26contest") for clock-specific Fmax
+        # Critical-path spread (drives whether a pblock re-placement is worthwhile)
+        self.critical_path_spread_info = None
+        self.pblock_recommended = False
         
         # Log file handles
         self._rw_log_file = None
@@ -562,19 +565,51 @@ class DCPOptimizer(DCPOptimizerBase):
         api_key: str,
         model: str = DEFAULT_MODEL,
         debug: bool = False,
-        run_dir: Optional[Path] = None
+        run_dir: Optional[Path] = None,
+        pre_opt: str = "phys_opt,pblock,cell_replace",
+        physopt_directive: str = "",
+        pblock_mode: str = "always",
+        cell_replace_mode: str = "auto",
+        skip_llm: bool = False,
+        phys_opt_timeout: int = 1200,
+        manual_timeout: int = 1200,
+        llm_timeout: int = 1200,
+        total_timeout: int = 3600,
+        cost_cap: float = 1.0
     ):
         super().__init__(debug=debug, run_dir=run_dir)
-        
+
         self.api_key = api_key
         self.model = model
+        # Deterministic pre-LLM optimization pipeline, run in order before the LLM.
+        # e.g. "phys_opt,pblock" -> phys_opt baseline, then pblock re-placement.
+        self.pre_opt_steps = [s.strip() for s in (pre_opt or "").split(",")
+                              if s.strip() and s.strip() != "none"]
+        self.physopt_directive = physopt_directive  # optional phys_opt directive
+        self.pblock_mode = pblock_mode            # auto | always | never
+        self.cell_replace_mode = cell_replace_mode  # auto | always | never
+        self.skip_llm = skip_llm                  # stop after deterministic baseline
+        # Wall-clock budgets (seconds) and cost cap ($). Contest limit: 1 hr + $1/benchmark.
+        # Phased 20/20/20: phys_opt | manual (pblock + cell_replace SHARE this) | LLM.
+        self.phys_opt_timeout = phys_opt_timeout  # phase-1 cap for phys_opt
+        self.manual_timeout = manual_timeout      # phase-2 cap SHARED by pblock + cell_replace
+        self.llm_timeout = llm_timeout            # phase-3 cap for the LLM stage
+        self.total_timeout = total_timeout        # hard overall cap (fallback guaranteed)
+        self.cost_cap = cost_cap                  # stop LLM before spending more than this
+        # Output-DCP protection: the contest scores the most-recently-modified
+        # *_optimized*.dcp, so we keep a protected copy of the best design and
+        # guarantee the final written output is never worse than it.
+        self.output_dcp: Optional[Path] = None
+        self.protected_best_dcp: Optional[Path] = None
+        self.protected_best_wns = float('-inf')
         self.tools: list[dict] = []
         self.messages: list[dict] = []
         
+        # LLM client is only needed when the LLM stage runs; skip when baseline-only.
         self.openai = OpenAI(
             api_key=api_key,
             base_url="https://openrouter.ai/api/v1"
-        )
+        ) if api_key else None
         
         # Track optimization progress
         self.iteration = 0
@@ -963,14 +998,20 @@ class DCPOptimizer(DCPOptimizerBase):
         summary.append("")
         
         # Critical path spread analysis
+        self.critical_path_spread_info = critical_path_spread_info
+        self.pblock_recommended = bool(
+            critical_path_spread_info
+            and critical_path_spread_info.get('avg_distance', 0) > 70
+            and critical_path_spread_info.get('paths_analyzed', 0) >= 5
+        )
         if critical_path_spread_info:
             summary.append("CRITICAL PATH SPREAD ANALYSIS:")
             summary.append(f"  Max cell distance: {critical_path_spread_info['max_distance']} tiles")
             summary.append(f"  Avg cell distance: {critical_path_spread_info['avg_distance']:.1f} tiles")
             summary.append(f"  Paths analyzed: {critical_path_spread_info['paths_analyzed']}")
-            
+
             # Recommendation based on spread
-            if critical_path_spread_info['avg_distance'] > 70 and critical_path_spread_info['paths_analyzed'] >= 5:
+            if self.pblock_recommended:
                 summary.append(f"  ⚠ RECOMMENDATION: Use PBLOCK strategy (high spread detected)")
             summary.append("")
         
@@ -1087,12 +1128,367 @@ class DCPOptimizer(DCPOptimizerBase):
             if self.messages:
                 logger.error(f"Last message: {self.messages[-1]}")
             raise
-    
+
+    def _elapsed(self) -> float:
+        """Seconds since optimize() started."""
+        return time.time() - self.start_time if self.start_time else 0.0
+
+    def _remaining_total(self) -> float:
+        """Seconds left in the overall wall-clock budget."""
+        return self.total_timeout - self._elapsed()
+
+    async def run_physopt_baseline(self, output_dcp: Path, timeout: Optional[int] = None) -> Optional[float]:
+        """Deterministic pre-LLM optimization: run phys_opt_design and save a
+        guaranteed baseline DCP.
+
+        phys_opt_design only commits changes that improve WNS, keeps the design
+        placed-and-routed, and preserves functional equivalence, so the saved
+        result is always a safe, valid submission that will pass validate_dcps.py.
+        The design must already be open in Vivado (from perform_initial_analysis).
+        Returns the post-optimization WNS (or None if it could not be measured)."""
+        print("\n=== Deterministic Pre-LLM Optimization: phys_opt_design ===\n")
+        wns_before = self.best_wns if self.best_wns > float('-inf') else self.initial_wns
+
+        directive = (self.physopt_directive or "").strip()
+        physopt_args = {"directive": directive} if directive else {}
+        if timeout:
+            physopt_args["timeout"] = int(timeout)
+        label = f"directive={directive}" if directive else "default optimizations"
+        tstr = f", timeout {timeout}s" if timeout else ""
+        logger.info(f"Running phys_opt_design ({label}{tstr})...")
+        print(f"Running phys_opt_design ({label}{tstr})... this may take a few minutes")
+        result = await self.call_tool("vivado_phys_opt_design", physopt_args)
+        if "error" in result.lower() and "complete" not in result.lower():
+            print(f"⚠ phys_opt_design reported an issue: {result[:300]}")
+
+        # Re-measure timing (call_tool auto-updates self.best_wns for the target clock)
+        print("Re-checking timing after phys_opt_design...")
+        await self.call_tool("vivado_report_timing_summary", {})
+        wns_after = self.best_wns if self.best_wns > float('-inf') else None
+
+        # Adopt only if the result is at least as good as the protected fallback (it
+        # normally is, since phys_opt does not regress setup WNS). This guards against
+        # a timed-out/interrupted phys_opt leaving a worse or broken in-memory design.
+        if wns_after is not None and wns_after >= self.protected_best_wns:
+            print(f"Saving baseline DCP to: {output_dcp}")
+            await self.call_tool("vivado_write_checkpoint", {
+                "dcp_path": str(output_dcp.resolve()), "force": True})
+            if self.protected_best_dcp is None:
+                self.protected_best_dcp = self.run_dir / "best_protected.dcp"
+            try:
+                shutil.copy2(output_dcp, self.protected_best_dcp)
+                self.protected_best_wns = wns_after
+            except Exception as e:
+                logger.warning(f"Could not update protected baseline copy: {e}")
+            delta = (wns_after - wns_before) if wns_before is not None else 0.0
+            fmax_after = self.calculate_fmax(wns_after, self.clock_period)
+            fmax_str = f", fmax: {fmax_after:.2f} MHz" if fmax_after is not None else ""
+            print(f"✓ Baseline saved. WNS {wns_before:.3f} → {wns_after:.3f} ns "
+                  f"(Δ {delta:+.3f} ns{fmax_str})\n")
+            return wns_after
+
+        # phys_opt did not help (or could not be measured / timed out) -> keep fallback.
+        cur = f"{wns_after:.3f} ns" if wns_after is not None else "unmeasurable"
+        print(f"⚠ phys_opt result ({cur}) not better than fallback "
+              f"({self.protected_best_wns:.3f} ns); keeping fallback.")
+        if (self.protected_best_dcp is not None and self.protected_best_dcp.exists()
+                and (wns_after is None or wns_after < self.protected_best_wns)):
+            await self.call_tool("vivado_open_checkpoint", {
+                "dcp_path": str(self.protected_best_dcp.resolve())})
+            print("✓ Restored fallback into Vivado.\n")
+        return None
+
+    @staticmethod
+    def _parse_pblock_targets(util_text: str) -> Optional[dict]:
+        """Parse the '1.5x Multiplier' section of report_utilization_for_pblock."""
+        section = util_text.split("1.5x Multiplier")[-1] if "1.5x Multiplier" in util_text else util_text
+        targets = {}
+        for key in ("LUT", "FF", "DSP", "BRAM", "URAM"):
+            m = re.search(rf"{key}s?:\s*([\d,]+)", section)
+            if m:
+                targets[key] = int(m.group(1).replace(",", ""))
+        return targets or None
+
+    @staticmethod
+    def _parse_json_field(text: str, field: str):
+        """Extract a field from a JSON tool result; None on error/invalid."""
+        try:
+            data = json.loads(text)
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(data, dict) or data.get("status") == "error" or "error" in data:
+            return None
+        return data.get(field)
+
+    async def run_pblock_baseline(self, output_dcp: Path, timeout: Optional[int] = None) -> Optional[float]:
+        """Deterministic pblock re-placement: consolidate a spread-out design into a
+        contiguous fabric region to cut wire delay, then re-place and re-route.
+
+        Functionally equivalent (same netlist; only placement/routing change). This
+        DESTRUCTIVELY re-places the design, so the result is adopted ONLY if it routes
+        cleanly AND beats the protected best; otherwise the protected baseline (e.g. the
+        phys_opt result) is reloaded into Vivado and kept. Returns the new WNS if adopted."""
+        print("\n=== Deterministic Pre-LLM Optimization: pblock re-placement ===\n")
+
+        # Gate: pblock helps spread-out designs; it is slow/pointless on compact ones.
+        if self.pblock_mode == "never":
+            print("pblock step disabled (--pblock-mode never). Skipping.\n")
+            return None
+        if self.pblock_mode == "auto" and not self.pblock_recommended:
+            print("pblock not recommended by spread analysis (design is compact); skipping. "
+                  "Use --pblock-mode always to force.\n")
+            return None
+
+        # 1. Resource utilization -> 1.5x targets
+        util = await self.call_tool("vivado_report_utilization_for_pblock", {})
+        targets = self._parse_pblock_targets(util)
+        if not targets or targets.get("LUT", 0) == 0:
+            print("⚠ Could not parse utilization for pblock sizing; skipping pblock.\n")
+            return None
+        # The shared utilization report occasionally fails to parse the FF count
+        # (label mismatch). Fall back to sizing the region for at least as many FFs
+        # as LUTs so the pblock is not undersized on FF-heavy designs. Over-sizing is
+        # safe: a slightly larger region still consolidates, and the revert-guard
+        # catches any placement/route failure regardless.
+        if targets.get("FF", 0) <= 0:
+            targets["FF"] = targets["LUT"]
+            logger.info("FF utilization parsed as 0; falling back to FF target = LUT target")
+        print(f"Target resources (1.5x): {targets}")
+
+        # 2. Analyze fabric for a contiguous region (RapidWright)
+        analysis = await self.call_tool("rapidwright_analyze_fabric_for_pblock", {
+            "target_lut_count": targets["LUT"],
+            "target_ff_count": targets.get("FF", 0),
+            "target_dsp_count": targets.get("DSP", 0),
+            "target_bram_count": targets.get("BRAM", 0),
+        })
+        region = self._parse_json_field(analysis, "recommended_region")
+        if not region:
+            print(f"⚠ Fabric analysis returned no region; skipping pblock.\n  {analysis[:300]}\n")
+            return None
+        print(f"Recommended region: cols {region['col_min']}-{region['col_max']}, "
+              f"rows {region['row_min']}-{region['row_max']}")
+
+        # 3. Convert region to Vivado pblock ranges (detailed site-specific)
+        conv = await self.call_tool("rapidwright_convert_fabric_region_to_pblock", {
+            "col_min": region["col_min"], "col_max": region["col_max"],
+            "row_min": region["row_min"], "row_max": region["row_max"],
+            "use_clock_regions": False,
+        })
+        pblock_ranges = self._parse_json_field(conv, "pblock_ranges")
+        if not pblock_ranges:
+            print(f"⚠ Could not build pblock ranges; skipping pblock.\n  {conv[:300]}\n")
+            return None
+        print(f"Pblock ranges: {pblock_ranges[:160]}{'...' if len(pblock_ranges) > 160 else ''}")
+
+        # 4. Unplace -> apply pblock -> re-place -> re-route
+        print("Unplacing design...")
+        await self.call_tool("vivado_run_tcl", {"command": "place_design -unplace"})
+        print("Applying pblock constraint...")
+        await self.call_tool("vivado_create_and_apply_pblock", {
+            "pblock_name": "pblock_opt",
+            "ranges": pblock_ranges,
+            "apply_to": "current_design",
+            "is_soft": False,
+        })
+        # Cap place and route by the pblock stage budget (split across the two ops).
+        pr_timeout = int(timeout / 2) if timeout else 3600
+        print(f"Placing design under pblock (timeout {pr_timeout}s)...")
+        await self.call_tool("vivado_place_design", {"directive": "Default", "timeout": pr_timeout})
+        print(f"Routing design (timeout {pr_timeout}s)...")
+        await self.call_tool("vivado_route_design", {"directive": "Default", "timeout": pr_timeout})
+
+        # 5. Check route status + timing
+        route_status = await self.call_tool("vivado_report_route_status", {})
+        fully_routed = ("fully routed" in route_status.lower()) or ("100.00%" in route_status)
+        await self.call_tool("vivado_report_timing_summary", {})
+        try:
+            wns_after = await super().get_wns_for_target_clock(self._call_vivado_tool)
+        except Exception:
+            wns_after = None
+        if wns_after is None and self.best_wns > float('-inf'):
+            wns_after = self.best_wns
+
+        # 6. Adopt only if routed AND improved; otherwise restore the protected baseline.
+        if fully_routed and wns_after is not None and wns_after > self.protected_best_wns:
+            fmax = self.calculate_fmax(wns_after, self.clock_period)
+            fmax_str = f", fmax: {fmax:.2f} MHz" if fmax is not None else ""
+            print(f"✓ pblock improved WNS to {wns_after:.3f} ns (was {self.protected_best_wns:.3f} ns"
+                  f"{fmax_str}). Saving as new baseline.\n")
+            await self.call_tool("vivado_write_checkpoint", {
+                "dcp_path": str(output_dcp.resolve()), "force": True})
+            if self.protected_best_dcp is not None:
+                try:
+                    shutil.copy2(output_dcp, self.protected_best_dcp)
+                except Exception as e:
+                    logger.warning(f"Could not update protected baseline copy: {e}")
+            self.protected_best_wns = wns_after
+            if wns_after > self.best_wns:
+                self.best_wns = wns_after
+            return wns_after
+
+        if not fully_routed:
+            reason = "did not route cleanly"
+        elif wns_after is not None:
+            reason = f"WNS {wns_after:.3f} ns did not beat baseline {self.protected_best_wns:.3f} ns"
+        else:
+            reason = "WNS could not be measured"
+        print(f"⚠ pblock {reason}; reverting to the protected baseline.")
+        if self.protected_best_dcp is not None and self.protected_best_dcp.exists():
+            await self.call_tool("vivado_open_checkpoint", {
+                "dcp_path": str(self.protected_best_dcp.resolve())})
+            print("✓ Restored protected baseline into Vivado.\n")
+        return None
+
+    async def run_cell_replacement_baseline(self, output_dcp: Path, timeout: Optional[int] = None) -> Optional[float]:
+        """Deterministic targeted cell re-placement (detour fix): move the highest-detour
+        critical cells to the centroid of their connections (RapidWright
+        optimize_cell_placement), then re-route in Vivado.
+
+        Placement-only: no netlist edits, no added registers, no clock changes -> stays
+        functionally equivalent (validate-safe). Runs AFTER pblock, on the CURRENT best
+        design (the adopted pblock result, or the reverted phys_opt result if pblock
+        raised congestion / failed). Adopted only if it routes cleanly AND beats the
+        protected best; otherwise the protected baseline is reloaded and kept."""
+        print("\n=== Deterministic Pre-LLM Optimization: cell re-placement (detour fix) ===\n")
+        if self.cell_replace_mode == "never":
+            print("cell re-placement disabled (--cell-replace-mode never). Skipping.\n")
+            return None
+        if self.protected_best_dcp is None or not self.protected_best_dcp.exists():
+            print("No protected baseline to operate on; skipping cell re-placement.\n")
+            return None
+
+        # 1. Critical-path pins from the CURRENT best design open in Vivado.
+        pins_file = Path(self.temp_dir) / "cellrepl_critical_pins.json"
+        await self.call_tool("vivado_extract_critical_path_pins", {
+            "num_paths": 10, "output_file": str(pins_file)})
+        if not pins_file.exists():
+            print("⚠ Could not extract critical-path pins; skipping cell re-placement.\n")
+            return None
+
+        # 2. Load the current best into RapidWright and analyze routing detours.
+        rw = await self.call_tool("rapidwright_read_checkpoint", {
+            "dcp_path": str(self.protected_best_dcp.resolve())})
+        if "error" in rw.lower() and "success" not in rw.lower():
+            print(f"⚠ RapidWright could not read current best DCP (possibly encrypted netlist); "
+                  f"skipping cell re-placement.\n  {rw[:200]}\n")
+            return None
+        analysis_txt = await self.call_tool("rapidwright_analyze_net_detour", {
+            "input_file": str(pins_file), "detour_threshold": 2.0})
+        try:
+            analysis = json.loads(analysis_txt)
+        except (ValueError, TypeError):
+            analysis = {}
+        candidates = analysis.get("candidates", []) if isinstance(analysis, dict) else []
+        if not candidates:
+            print("No high-detour candidate cells found; skipping cell re-placement.\n")
+            return None
+        # Target cells on the worst paths (index <= 2), else the single worst.
+        cell_names = list({str(c["cell"]) for c in candidates if c.get("path", 99) <= 2})
+        if not cell_names:
+            cell_names = [str(candidates[0]["cell"])]
+        print(f"Re-placing {len(cell_names)} high-detour cells "
+              f"(of {len(candidates)} candidates): {', '.join(cell_names[:5])}"
+              f"{'...' if len(cell_names) > 5 else ''}")
+
+        # 3. Re-place cells in RapidWright and write an intermediate DCP.
+        await self.call_tool("rapidwright_optimize_cell_placement", {
+            "cell_names": cell_names, "max_candidates": 10})
+        rw_dcp = Path(self.temp_dir) / "cellrepl_optimized.dcp"
+        await self.call_tool("rapidwright_write_checkpoint", {"dcp_path": str(rw_dcp)})
+        if not rw_dcp.exists():
+            print("⚠ RapidWright produced no optimized DCP; reverting.\n")
+            await self.call_tool("vivado_open_checkpoint", {
+                "dcp_path": str(self.protected_best_dcp.resolve())})
+            return None
+
+        # 4. Open in Vivado, re-route the moved nets, measure.
+        pr_timeout = int(timeout) if timeout else 3600
+        await self.call_tool("vivado_open_checkpoint", {"dcp_path": str(rw_dcp.resolve())})
+        print(f"Re-routing after cell moves (timeout {pr_timeout}s)...")
+        await self.call_tool("vivado_route_design", {"directive": "Default", "timeout": pr_timeout})
+        route_status = await self.call_tool("vivado_report_route_status", {})
+        err_m = re.search(r"nets with routing errors.*?:\s*(\d+)", route_status)
+        route_errors = int(err_m.group(1)) if err_m else None
+        routed_ok = ("fully routed" in route_status.lower()) or (route_errors == 0)
+        await self.call_tool("vivado_report_timing_summary", {})
+        try:
+            wns_after = await super().get_wns_for_target_clock(self._call_vivado_tool)
+        except Exception:
+            wns_after = None
+
+        # 5. Adopt only if routed cleanly AND improved; else revert to protected best.
+        if routed_ok and wns_after is not None and wns_after > self.protected_best_wns:
+            fmax = self.calculate_fmax(wns_after, self.clock_period)
+            fmax_str = f", fmax: {fmax:.2f} MHz" if fmax is not None else ""
+            print(f"✓ cell re-placement improved WNS to {wns_after:.3f} ns "
+                  f"(was {self.protected_best_wns:.3f} ns{fmax_str}). Saving as new baseline.\n")
+            await self.call_tool("vivado_write_checkpoint", {
+                "dcp_path": str(output_dcp.resolve()), "force": True})
+            try:
+                shutil.copy2(output_dcp, self.protected_best_dcp)
+            except Exception as e:
+                logger.warning(f"Could not update protected baseline copy: {e}")
+            self.protected_best_wns = wns_after
+            if wns_after > self.best_wns:
+                self.best_wns = wns_after
+            return wns_after
+
+        if not routed_ok:
+            reason = f"did not route cleanly ({route_errors} routing errors)" if route_errors else "did not route cleanly"
+        elif wns_after is not None:
+            reason = f"WNS {wns_after:.3f} ns did not beat baseline {self.protected_best_wns:.3f} ns"
+        else:
+            reason = "WNS could not be measured"
+        print(f"⚠ cell re-placement {reason}; reverting to protected baseline.")
+        await self.call_tool("vivado_open_checkpoint", {
+            "dcp_path": str(self.protected_best_dcp.resolve())})
+        print("✓ Restored protected baseline into Vivado.\n")
+        return None
+
+    async def finalize_output(self, output_dcp: Path):
+        """Guarantee the scored output DCP is never worse than the protected best.
+
+        The contest scores the most-recently-modified *_optimized*.dcp, so the LLM
+        stage can clobber a good baseline with a worse design. Here we make the LAST
+        write the best design: if the current in-memory design beats the protected
+        best we save it; otherwise we restore the protected baseline as the newest
+        file. Safe against invalid/unroutable in-memory states (falls back to baseline)."""
+        if self.protected_best_dcp is None or not self.protected_best_dcp.exists():
+            return  # no baseline to protect (pre_opt disabled or copy failed)
+
+        try:
+            current_wns = await super().get_wns_for_target_clock(self._call_vivado_tool)
+        except Exception as e:
+            logger.warning(f"finalize: could not measure current WNS ({e}); restoring baseline")
+            current_wns = None
+
+        if current_wns is not None and current_wns > self.protected_best_wns:
+            logger.info(f"finalize: current design ({current_wns:.3f} ns) beats protected best "
+                        f"({self.protected_best_wns:.3f} ns); saving it as final output")
+            try:
+                await self.call_tool("vivado_write_checkpoint", {
+                    "dcp_path": str(output_dcp.resolve()), "force": True
+                })
+                shutil.copy2(output_dcp, self.protected_best_dcp)
+                self.protected_best_wns = current_wns
+            except Exception as e:
+                logger.warning(f"finalize: writing improved output failed ({e}); restoring baseline")
+                shutil.copy2(self.protected_best_dcp, output_dcp)
+        else:
+            cur_str = f"{current_wns:.3f}" if current_wns is not None else "unknown"
+            logger.info(f"finalize: current design ({cur_str} ns) does not beat protected best "
+                        f"({self.protected_best_wns:.3f} ns); restoring protected baseline as final output")
+            shutil.copy2(self.protected_best_dcp, output_dcp)
+        print(f"✓ Final output DCP guaranteed at WNS {self.protected_best_wns:.3f} ns "
+              f"(never worse than the deterministic baseline): {output_dcp}")
+
     async def optimize(self, input_dcp: Path, output_dcp: Path) -> bool:
         """Run the optimization workflow."""
         # Start timing the optimization process
         self.start_time = time.time()
-        
+        self.output_dcp = output_dcp
+
         # Perform initial analysis without LLM
         try:
             initial_analysis = await self.perform_initial_analysis(input_dcp)
@@ -1129,7 +1525,79 @@ class DCPOptimizer(DCPOptimizerBase):
             print(f"Estimated cost: $0.00")
             print("="*70 + "\n")
             return True
-        
+
+        # === Guaranteed fallback ===
+        # Immediately save the current (original, already-routed) design as the output
+        # so a valid, functionally-identical submission ALWAYS exists, even if every
+        # optimization step below fails or the 1-hour budget is exhausted early.
+        try:
+            print("Saving initial fallback DCP (original design)...")
+            await self.call_tool("vivado_write_checkpoint", {
+                "dcp_path": str(output_dcp.resolve()), "force": True})
+            self.protected_best_dcp = self.run_dir / "best_protected.dcp"
+            shutil.copy2(output_dcp, self.protected_best_dcp)
+            self.protected_best_wns = self.initial_wns if self.initial_wns is not None else float('-inf')
+            logger.info(f"Initial fallback saved (WNS {self.protected_best_wns:.3f} ns)")
+        except Exception as e:
+            logger.warning(f"Could not save initial fallback: {e}")
+
+        # === Deterministic pre-LLM optimization pipeline (wall-clock bounded) ===
+        # Runs each configured step in order (e.g. phys_opt -> pblock). Every step is
+        # functionally equivalent and only keeps a result that beats the protected
+        # baseline. Each step is capped by its own budget AND the overall time left,
+        # so a single place/route on a huge design cannot blow the 1-hour limit.
+        # Phased budgets: phys_opt gets its own phase; pblock + cell_replace SHARE the
+        # "manual" phase budget (so both fit in the middle 20-min slot, per the plan).
+        MANUAL_STEPS = {"pblock", "cell_replace"}
+        manual_deadline = None  # elapsed-time deadline for the shared manual phase
+        for step in self.pre_opt_steps:
+            remaining = self._remaining_total()
+            if remaining <= 60:
+                print(f"⏱ Time budget nearly exhausted ({remaining:.0f}s left); skipping '{step}'.\n")
+                continue
+            if step in MANUAL_STEPS:
+                if manual_deadline is None:
+                    manual_deadline = self._elapsed() + self.manual_timeout
+                manual_left = manual_deadline - self._elapsed()
+                if manual_left <= 30:
+                    print(f"⏱ Manual-opt phase budget exhausted; skipping '{step}'.\n")
+                    continue
+                budget = int(min(manual_left, remaining - 30))
+            else:  # phys_opt (and any future dedicated-phase step)
+                budget = int(min(self.phys_opt_timeout, remaining - 30))
+            print(f"⏱ Stage '{step}': budget {budget}s (overall {remaining:.0f}s left of {self.total_timeout}s)")
+            try:
+                if step == "phys_opt":
+                    await self.run_physopt_baseline(output_dcp, timeout=budget)
+                elif step == "pblock":
+                    await self.run_pblock_baseline(output_dcp, timeout=budget)
+                elif step == "cell_replace":
+                    await self.run_cell_replacement_baseline(output_dcp, timeout=budget)
+                else:
+                    logger.warning(f"Unknown pre-opt step '{step}', skipping")
+            except Exception as e:
+                logger.exception(f"Pre-opt step '{step}' failed: {e}")
+                print(f"⚠ Pre-opt step '{step}' failed, continuing: {e}\n")
+            if self.best_wns >= 0:
+                break  # timing already met; no need for further pre-opt
+
+        # WNS of the best deterministic result so far (for the LLM status note).
+        baseline_wns = (self.protected_best_wns
+                        if (self.protected_best_dcp and self.protected_best_wns > float('-inf'))
+                        else None)
+
+        # If timing is now met, or the LLM stage is disabled, stop here.
+        if self.best_wns >= 0:
+            print("✓ Timing met after deterministic optimization! No LLM stage needed.\n")
+            self.end_time = time.time()
+            self._print_optimization_summary()
+            return True
+        if self.skip_llm:
+            print("Skipping LLM stage (--skip-llm). Baseline DCP is the final result.\n")
+            self.end_time = time.time()
+            self._print_optimization_summary()
+            return True
+
         # Load and fill in system prompt with temp directory and input DCP path
         system_prompt_template = load_system_prompt()
         system_prompt = system_prompt_template.format(
@@ -1159,25 +1627,57 @@ INITIAL ANALYSIS RESULTS:
 Proceed with optimization strategy based on the analysis above. Do NOT reload the design in either Vivado or RapidWright - both already have it loaded."""
             }
         ]
+
+        # If a deterministic phys_opt baseline already ran, tell the LLM the current
+        # in-memory state so it doesn't act on the stale pre-optimization numbers and
+        # only pursues changes that beat the baseline already saved to the output DCP.
+        if baseline_wns is not None:
+            baseline_fmax = self.calculate_fmax(baseline_wns, self.clock_period)
+            fmax_str = f" (fmax: {baseline_fmax:.2f} MHz)" if baseline_fmax is not None else ""
+            self.messages.append({
+                "role": "user",
+                "content": (
+                    f"IMPORTANT UPDATE: A deterministic phys_opt_design pass has ALREADY been "
+                    f"run on the open design. The CURRENT in-memory WNS is {baseline_wns:.3f} ns{fmax_str}, "
+                    f"and this baseline is ALREADY SAVED to the output DCP. Only commit further changes "
+                    f"if they IMPROVE on {baseline_wns:.3f} ns; if you cannot beat it, keep the current "
+                    f"result and finish. Do NOT re-run the same default phys_opt_design again."
+                )
+            })
         
         max_iterations = 50  # Safety limit
-        
-        print("=== Starting LLM-Driven Optimization ===\n")
-        
+        llm_stage_start = self._elapsed()
+
+        print(f"=== Starting LLM-Driven Optimization (budget: {self.llm_timeout}s, "
+              f"${self.cost_cap:.2f}, {self._remaining_total():.0f}s of 1hr left) ===\n")
+
+        stop_reason = None
         while self.iteration < max_iterations:
+            # Enforce wall-clock and cost budgets before each LLM iteration.
+            if self._remaining_total() <= 30:
+                stop_reason = f"overall 1-hour budget reached ({self._remaining_total():.0f}s left)"
+                break
+            if (self._elapsed() - llm_stage_start) >= self.llm_timeout:
+                stop_reason = f"LLM stage time budget ({self.llm_timeout}s) reached"
+                break
+            if self.total_cost >= self.cost_cap:
+                stop_reason = f"cost cap (${self.cost_cap:.2f}) reached at ${self.total_cost:.4f}"
+                break
+
             self.iteration += 1
             logger.info(f"=== Iteration {self.iteration} ===")
-            
+
             try:
                 response_text, is_done = await self.get_completion()
                 print(f"\n{response_text}\n")
-                
+
                 if is_done:
                     logger.info("Optimization workflow completed")
+                    await self.finalize_output(output_dcp)
                     self.end_time = time.time()
                     self._print_optimization_summary()
                     return True
-                    
+
             except Exception as e:
                 logger.exception(f"Error during optimization: {e}")
                 # Add error context to conversation
@@ -1185,11 +1685,16 @@ Proceed with optimization strategy based on the analysis above. Do NOT reload th
                     "role": "user",
                     "content": f"An error occurred: {e}. Please verify your approach and continue or report if unrecoverable."
                 })
-        
-        logger.warning("Reached maximum iterations")
+
+        logger.warning(f"LLM stage stopped: {stop_reason or 'reached maximum iterations'}")
+        print(f"\n⏱ LLM stage stopped: {stop_reason or 'reached maximum iterations'}\n")
+        # Guarantee the output DCP is the best design (never worse than the baseline).
+        await self.finalize_output(output_dcp)
         self.end_time = time.time()
         self._print_optimization_summary(max_iterations_reached=True)
-        return False
+        # A protected baseline still exists, so the run produced a valid, improved
+        # submission even though the LLM did not signal completion.
+        return self.protected_best_dcp is not None
     
     def save_token_usage_report(self, output_path: Path):
         """Save detailed token usage report to JSON file."""
@@ -2645,7 +3150,7 @@ async def run_test_mode(input_dcp: Path, output_dcp: Path, debug: bool = False, 
         await tester.start_servers()
         
         if design_type == "logicnets":
-            success = await tester.run_test_kitta(input_dcp, output_dcp)
+            success = await tester.run_test_logicnets(input_dcp, output_dcp)
         else:
             success = await tester.run_test_vexriscv(input_dcp, output_dcp)
         
@@ -2723,7 +3228,46 @@ Examples:
         default=5,
         help="Maximum number of high fanout nets to optimize in test mode (default: 5)"
     )
-    
+    parser.add_argument(
+        "--pre-opt",
+        type=str,
+        default="phys_opt,pblock",
+        help="Comma-separated deterministic steps to run (in order) before the LLM stage. "
+             "Supported: phys_opt, pblock, none. Default: 'phys_opt,pblock'."
+    )
+    parser.add_argument(
+        "--physopt-directive",
+        type=str,
+        default="",
+        help="Optional phys_opt_design directive (e.g. Explore, AggressiveExplore, RuntimeOptimized). Empty = default optimizations."
+    )
+    parser.add_argument(
+        "--pblock-mode",
+        choices=["auto", "always", "never"],
+        default="always",
+        help="When to run the pblock re-placement step: always = attempt on every design "
+             "(default; self-reverts if it doesn't help, time-bounded), auto = only if spread "
+             "analysis recommends it, never = skip."
+    )
+    parser.add_argument("--cell-replace-mode", choices=["auto", "always", "never"], default="auto",
+                        help="Cell re-placement (detour fix) step: auto = run if high-detour cells exist "
+                             "(default), always = force, never = skip.")
+    parser.add_argument("--phys-opt-timeout", type=int, default=1200,
+                        help="Wall-clock budget (s) for the phys_opt stage (default: 1200 = 20 min)")
+    parser.add_argument("--manual-timeout", type=int, default=1200,
+                        help="Wall-clock budget (s) SHARED by the manual stages (pblock + cell_replace) (default: 1200 = 20 min)")
+    parser.add_argument("--llm-timeout", type=int, default=1200,
+                        help="Wall-clock budget (s) for the LLM stage (default: 1200 = 20 min)")
+    parser.add_argument("--total-timeout", type=int, default=3600,
+                        help="Hard overall wall-clock cap (s); a valid fallback is always saved (default: 3600 = 1 hr)")
+    parser.add_argument("--cost-cap", type=float, default=1.0,
+                        help="Stop the LLM stage before spending more than this many USD (default: 1.0)")
+    parser.add_argument(
+        "--skip-llm",
+        action="store_true",
+        help="Run only the deterministic pre-LLM optimization and skip the LLM stage (fast, ~$0 cost, safe baseline)."
+    )
+
     args = parser.parse_args()
     
     # Validate inputs
@@ -2767,12 +3311,13 @@ Examples:
         )
         sys.exit(exit_code)
     
-    # Normal mode - requires API key and LLM
-    if not args.api_key:
+    # Normal mode - requires API key, unless the LLM stage is skipped (baseline-only)
+    if not args.api_key and not args.skip_llm:
         print("Error: OpenRouter API key required. Set OPENROUTER_API_KEY or use --api-key", file=sys.stderr)
-        print("       Use --test flag to run in test mode without LLM", file=sys.stderr)
+        print("       Use --skip-llm to run the deterministic baseline without an LLM,", file=sys.stderr)
+        print("       or --test for the standalone test mode.", file=sys.stderr)
         sys.exit(1)
-    
+
     if OpenAI is None:
         print("Error: openai package not installed. Run: pip install openai", file=sys.stderr)
         sys.exit(1)
@@ -2787,13 +3332,26 @@ Examples:
     print(f"Output:      {args.output_dcp.resolve()}")
     print(f"Run dir:     {run_dir}")
     print(f"Model:       {args.model}")
+    print(f"Pre-opt:     {args.pre_opt}" + (f" (physopt directive={args.physopt_directive})" if args.physopt_directive else "") + f" [pblock={args.pblock_mode}, cell_replace={args.cell_replace_mode}]")
+    print(f"LLM stage:   {'DISABLED (--skip-llm)' if args.skip_llm else 'enabled'}")
+    print(f"Budgets:     phys_opt {args.phys_opt_timeout}s | manual(pblock+cell) {args.manual_timeout}s | LLM {args.llm_timeout}s | total {args.total_timeout}s | cost ${args.cost_cap:.2f}")
     print()
-    
+
     optimizer = DCPOptimizer(
         api_key=args.api_key,
         model=args.model,
         debug=args.debug,
-        run_dir=run_dir
+        run_dir=run_dir,
+        pre_opt=args.pre_opt,
+        physopt_directive=args.physopt_directive,
+        pblock_mode=args.pblock_mode,
+        cell_replace_mode=args.cell_replace_mode,
+        skip_llm=args.skip_llm,
+        phys_opt_timeout=args.phys_opt_timeout,
+        manual_timeout=args.manual_timeout,
+        llm_timeout=args.llm_timeout,
+        total_timeout=args.total_timeout,
+        cost_cap=args.cost_cap
     )
     
     try:
