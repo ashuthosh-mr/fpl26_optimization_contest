@@ -566,11 +566,12 @@ class DCPOptimizer(DCPOptimizerBase):
         model: str = DEFAULT_MODEL,
         debug: bool = False,
         run_dir: Optional[Path] = None,
-        pre_opt: str = "phys_opt,relocate,pblock,cell_replace",
+        pre_opt: str = "phys_opt,relocate,retime,pblock,cell_replace",
         physopt_directive: str = "",
         pblock_mode: str = "always",
         cell_replace_mode: str = "auto",
         relocate_mode: str = "always",
+        retime_mode: str = "always",
         skip_llm: bool = False,
         phys_opt_timeout: int = 1200,
         manual_timeout: int = 1200,
@@ -590,6 +591,7 @@ class DCPOptimizer(DCPOptimizerBase):
         self.pblock_mode = pblock_mode            # auto | always | never
         self.cell_replace_mode = cell_replace_mode  # auto | always | never
         self.relocate_mode = relocate_mode        # auto | always | never
+        self.retime_mode = retime_mode            # auto | always | never
         self.skip_llm = skip_llm                  # stop after deterministic baseline
         # Wall-clock budgets (seconds) and cost cap ($). Contest limit: 1 hr + $1/benchmark.
         # Phased 20/20/20: phys_opt | manual (pblock + cell_replace SHARE this) | LLM.
@@ -602,6 +604,7 @@ class DCPOptimizer(DCPOptimizerBase):
         # *_optimized*.dcp, so we keep a protected copy of the best design and
         # guarantee the final written output is never worse than it.
         self.output_dcp: Optional[Path] = None
+        self._golden_input: Optional[Path] = None  # original input DCP, for equivalence gating
         self.protected_best_dcp: Optional[Path] = None
         self.protected_best_wns = float('-inf')
         self.tools: list[dict] = []
@@ -1570,6 +1573,106 @@ set fh [open {%RESULT%} w]; puts $fh $r; close $fh
             print("✓ Restored protected baseline into Vivado.\n")
         return None
 
+    async def _validate_equivalence(self, golden: Path, revised: Path, vectors: int = 100) -> bool:
+        """Run validate_dcps.py as a subprocess; True iff 'Overall Result: PASSED'.
+        Gates netlist-editing stages (retiming) before adoption so we never keep a
+        result that would score 0 on the official validator."""
+        script_dir = Path(__file__).parent.resolve()
+        py = script_dir / "venv" / "bin" / "python"
+        if not py.exists():
+            py = Path(sys.executable)
+        cmd = [str(py), str(script_dir / "validate_dcps.py"),
+               str(golden.resolve()), str(revised.resolve()), "--vectors", str(vectors)]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd, cwd=str(script_dir),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+            out, _ = await proc.communicate()
+            text = out.decode(errors="replace")
+            passed = "Overall Result: PASSED" in text
+            if not passed:
+                logger.warning(f"Equivalence check did not pass. Tail:\n{text[-600:]}")
+            return passed
+        except Exception as e:
+            logger.warning(f"Equivalence subprocess failed: {e}")
+            return False
+
+    async def run_retime_baseline(self, output_dcp: Path, timeout: Optional[int] = None) -> Optional[float]:
+        """Deterministic register retiming for logic-depth-bound critical paths.
+
+        Runs `phys_opt_design -retime`, which rebalances registers ACROSS combinational
+        logic to shorten deep paths (long carry chains / LUT cones) WITHOUT changing
+        latency or cycle-by-cycle I/O behavior -- retiming is latency-preserving. This is
+        the one lever that helps logic-depth paths that placement (relocate/pblock) cannot.
+
+        Because retiming EDITS the netlist (unlike the placement-only stages), it is not
+        guaranteed equivalent in every corner (registers with INIT / async set-reset / CE
+        can shift post-reset behavior). So this stage is safe-by-construction: it adopts
+        the retimed result ONLY if it (a) beats the protected best WNS AND (b) PASSES the
+        equivalence validator against the golden input; otherwise it reverts. Returns the
+        new WNS if adopted."""
+        print("\n=== Deterministic Pre-LLM Optimization: register retiming ===\n")
+        if getattr(self, "retime_mode", "always") == "never":
+            print("retiming disabled (--retime-mode never). Skipping.\n")
+            return None
+        if self.protected_best_dcp is None or not self.protected_best_dcp.exists():
+            print("No protected baseline to operate on; skipping retiming.\n")
+            return None
+        if self._golden_input is None or not Path(self._golden_input).exists():
+            print("No golden input available for equivalence gate; skipping retiming.\n")
+            return None
+
+        rt = int(timeout) if timeout else 1200
+        print(f"Running phys_opt_design -retime (timeout {rt}s)...")
+        await self.call_tool("vivado_run_tcl", {"command": "phys_opt_design -retime", "timeout": rt})
+
+        await self.call_tool("vivado_report_timing_summary", {})
+        try:
+            wns_after = await super().get_wns_for_target_clock(self._call_vivado_tool)
+        except Exception:
+            wns_after = None
+        if wns_after is None and self.best_wns > float('-inf'):
+            wns_after = self.best_wns
+
+        if wns_after is None or wns_after <= self.protected_best_wns:
+            cur = f"{wns_after:.3f} ns" if wns_after is not None else "unmeasurable"
+            print(f"⚠ retiming ({cur}) did not beat baseline "
+                  f"({self.protected_best_wns:.3f} ns); reverting.")
+            if self.protected_best_dcp.exists():
+                await self.call_tool("vivado_open_checkpoint", {
+                    "dcp_path": str(self.protected_best_dcp.resolve())})
+                print("✓ Restored protected baseline into Vivado.\n")
+            return None
+
+        # WNS improved -> write candidate and GATE on functional equivalence before adopting.
+        cand = Path(self.temp_dir) / "retime_candidate.dcp"
+        await self.call_tool("vivado_write_checkpoint", {
+            "dcp_path": str(cand.resolve()), "force": True})
+        print(f"Retiming improved WNS to {wns_after:.3f} ns (was {self.protected_best_wns:.3f} ns); "
+              f"running equivalence check before adopting (retiming edits the netlist)...")
+        equiv = await self._validate_equivalence(Path(self._golden_input), cand, vectors=100)
+        if not equiv:
+            print("⚠ retiming FAILED the equivalence check; reverting to protected baseline "
+                  "(safe: nothing broken is ever kept).\n")
+            await self.call_tool("vivado_open_checkpoint", {
+                "dcp_path": str(self.protected_best_dcp.resolve())})
+            return None
+
+        fmax = self.calculate_fmax(wns_after, self.clock_period)
+        fmax_str = f", fmax: {fmax:.2f} MHz" if fmax is not None else ""
+        print(f"✓ retiming improved WNS to {wns_after:.3f} ns AND passed equivalence "
+              f"(was {self.protected_best_wns:.3f} ns{fmax_str}). Saving as new baseline.\n")
+        await self.call_tool("vivado_write_checkpoint", {
+            "dcp_path": str(output_dcp.resolve()), "force": True})
+        try:
+            shutil.copy2(output_dcp, self.protected_best_dcp)
+        except Exception as e:
+            logger.warning(f"Could not update protected baseline copy: {e}")
+        self.protected_best_wns = wns_after
+        if wns_after > self.best_wns:
+            self.best_wns = wns_after
+        return wns_after
+
     async def run_cell_replacement_baseline(self, output_dcp: Path, timeout: Optional[int] = None) -> Optional[float]:
         """Deterministic targeted cell re-placement (detour fix): move the highest-detour
         critical cells to the centroid of their connections (RapidWright
@@ -1718,6 +1821,7 @@ set fh [open {%RESULT%} w]; puts $fh $r; close $fh
         # Start timing the optimization process
         self.start_time = time.time()
         self.output_dcp = output_dcp
+        self._golden_input = input_dcp  # needed by the retiming stage's equivalence gate
 
         # Perform initial analysis without LLM
         try:
@@ -1801,6 +1905,8 @@ set fh [open {%RESULT%} w]; puts $fh $r; close $fh
                     await self.run_physopt_baseline(output_dcp, timeout=budget)
                 elif step == "relocate":
                     await self.run_relocate_baseline(output_dcp, timeout=budget)
+                elif step == "retime":
+                    await self.run_retime_baseline(output_dcp, timeout=budget)
                 elif step == "pblock":
                     await self.run_pblock_baseline(output_dcp, timeout=budget)
                 elif step == "cell_replace":
@@ -3463,10 +3569,10 @@ Examples:
     parser.add_argument(
         "--pre-opt",
         type=str,
-        default="phys_opt,relocate,pblock,cell_replace",
+        default="phys_opt,relocate,retime,pblock,cell_replace",
         help="Comma-separated deterministic steps to run (in order) before the LLM stage. "
-             "Supported: phys_opt, relocate, pblock, cell_replace, none. "
-             "Default: 'phys_opt,relocate,pblock,cell_replace'."
+             "Supported: phys_opt, relocate, retime, pblock, cell_replace, none. "
+             "Default: 'phys_opt,relocate,retime,pblock,cell_replace'."
     )
     parser.add_argument(
         "--physopt-directive",
@@ -3490,6 +3596,11 @@ Examples:
                              "register bank next to its fixed hard-macro anchor (DSP/BRAM/URAM). "
                              "always = attempt every design (default; self-reverts if it doesn't help), "
                              "never = skip.")
+    parser.add_argument("--retime-mode", choices=["auto", "always", "never"], default="always",
+                        help="Register retiming step (phys_opt_design -retime): rebalances registers "
+                             "across logic to shorten logic-depth-bound paths, latency-preserving. "
+                             "Gated by an in-stage equivalence check; adopts only if timing improves "
+                             "AND equivalence passes. always = attempt (default), never = skip.")
     parser.add_argument("--phys-opt-timeout", type=int, default=1200,
                         help="Wall-clock budget (s) for the phys_opt stage (default: 1200 = 20 min)")
     parser.add_argument("--manual-timeout", type=int, default=1200,
@@ -3570,7 +3681,7 @@ Examples:
     print(f"Output:      {args.output_dcp.resolve()}")
     print(f"Run dir:     {run_dir}")
     print(f"Model:       {args.model}")
-    print(f"Pre-opt:     {args.pre_opt}" + (f" (physopt directive={args.physopt_directive})" if args.physopt_directive else "") + f" [relocate={args.relocate_mode}, pblock={args.pblock_mode}, cell_replace={args.cell_replace_mode}]")
+    print(f"Pre-opt:     {args.pre_opt}" + (f" (physopt directive={args.physopt_directive})" if args.physopt_directive else "") + f" [relocate={args.relocate_mode}, retime={args.retime_mode}, pblock={args.pblock_mode}, cell_replace={args.cell_replace_mode}]")
     print(f"LLM stage:   {'DISABLED (--skip-llm)' if args.skip_llm else 'enabled'}")
     print(f"Budgets:     phys_opt {args.phys_opt_timeout}s | manual(pblock+cell) {args.manual_timeout}s | LLM {args.llm_timeout}s | total {args.total_timeout}s | cost ${args.cost_cap:.2f}")
     print()
@@ -3585,6 +3696,7 @@ Examples:
         pblock_mode=args.pblock_mode,
         cell_replace_mode=args.cell_replace_mode,
         relocate_mode=args.relocate_mode,
+        retime_mode=args.retime_mode,
         skip_llm=args.skip_llm,
         phys_opt_timeout=args.phys_opt_timeout,
         manual_timeout=args.manual_timeout,

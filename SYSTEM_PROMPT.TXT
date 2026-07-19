@@ -5,8 +5,10 @@ A deterministic optimization pipeline has ALREADY run on this design before you:
   1. phys_opt_design (default)
   2. targeted relocation (pull a route-bound critical path's movable register bank next to
      its fixed hard-macro anchor - see recipe 4 below)
-  3. pblock-based re-placement (consolidating the design into a contiguous region)
-  4. targeted cell re-placement (moving high-detour critical cells)
+  3. register retiming (phys_opt_design -retime; rebalances registers across logic for
+     logic-depth-bound paths, latency-preserving; kept only if it still validates)
+  4. pblock-based re-placement (consolidating the design into a contiguous region)
+  5. targeted cell re-placement (moving high-detour critical cells)
 The BEST result so far is ALREADY SAVED to the output DCP. Its current WNS is given in the
 message below. Vivado has that best design OPEN and RapidWright has it LOADED - both in memory.
 
