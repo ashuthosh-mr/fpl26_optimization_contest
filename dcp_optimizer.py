@@ -2295,6 +2295,8 @@ set fh [open {%RESULT%} w]; puts $fh $r; close $fh
                 budget = int(min(manual_left, remaining - 30))
             elif step == "reimpl":  # final fallback: its own (larger) dedicated budget
                 budget = int(min(self.reimpl_timeout, remaining - 30))
+            elif step == "llm":  # LLM stage self-limits via llm_timeout; budget here is informational
+                budget = int(min(self.llm_timeout, remaining - 30))
             else:  # phys_opt (and any future dedicated-phase step)
                 budget = int(min(self.phys_opt_timeout, remaining - 30))
             print(f"⏱ Stage '{step}': budget {budget}s (overall {remaining:.0f}s left of {self.total_timeout}s)")
@@ -2313,6 +2315,11 @@ set fh [open {%RESULT%} w]; puts $fh $r; close $fh
                     await self.run_cell_replacement_baseline(output_dcp, timeout=budget)
                 elif step == "reimpl":
                     await self.run_reimpl_baseline(output_dcp, timeout=budget)
+                elif step == "llm":
+                    if self.skip_llm:
+                        print("'llm' step present in --pre-opt but --skip-llm is set; skipping it.\n")
+                    else:
+                        await self._run_llm_stage(input_dcp, output_dcp, initial_analysis)
                 else:
                     logger.warning(f"Unknown pre-opt step '{step}', skipping")
             except Exception as e:
@@ -2326,31 +2333,39 @@ set fh [open {%RESULT%} w]; puts $fh $r; close $fh
                         if (self.protected_best_dcp and self.protected_best_wns > float('-inf'))
                         else None)
 
-        # If timing is now met, or the LLM stage is disabled, stop here.
+        # If timing is now met after the deterministic pipeline, finish here.
         if self.protected_best_wns >= 0:
-            print("✓ Timing met after deterministic optimization! No LLM stage needed.\n")
-            self.end_time = time.time()
-            self._print_optimization_summary()
-            return True
-        if self.skip_llm:
-            print("Skipping LLM stage (--skip-llm). Baseline DCP is the final result.\n")
+            print("✓ Timing met after deterministic optimization!\n")
+            await self.finalize_output(output_dcp)
             self.end_time = time.time()
             self._print_optimization_summary()
             return True
 
-        # Load and fill in system prompt with temp directory and input DCP path
+        # Trailing LLM phase: run ONLY if 'llm' was not already a positioned pipeline
+        # step (in --pre-opt) and the LLM is not disabled. When 'llm' IS in --pre-opt
+        # (e.g. phys_opt,llm,relocate,...), it already ran at its position in the loop.
+        if "llm" not in self.pre_opt_steps and not self.skip_llm:
+            await self._run_llm_stage(input_dcp, output_dcp, initial_analysis)
+        elif self.skip_llm and "llm" not in self.pre_opt_steps:
+            print("Skipping LLM stage (--skip-llm). Deterministic baseline is the final result.\n")
+
+        await self.finalize_output(output_dcp)
+        self.end_time = time.time()
+        self._print_optimization_summary()
+        return self.protected_best_dcp is not None
+
+    async def _run_llm_stage(self, input_dcp: Path, output_dcp: Path, initial_analysis: str) -> None:
+        """LLM-driven optimization loop. Runs either as a positioned pipeline step ('llm'
+        in --pre-opt, e.g. phys_opt,llm,relocate,...) or as the trailing phase. Updates the
+        protected best + output DCP but does NOT print the final summary or set end_time --
+        optimize() does that exactly once after all stages complete."""
+        baseline_wns = self.protected_best_wns if self.protected_best_wns > float('-inf') else None
         system_prompt_template = load_system_prompt()
         system_prompt = system_prompt_template.format(
-            temp_dir=self.temp_dir,
-            input_dcp=input_dcp.resolve()
-        )
-        
-        # Initialize conversation with analysis results
+            temp_dir=self.temp_dir, input_dcp=input_dcp.resolve())
         self.messages = [
             {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": f"""Optimize this FPGA design for timing.
+            {"role": "user", "content": f"""Optimize this FPGA design for timing.
 
 PATHS:
 - Input DCP: {input_dcp.resolve()}
@@ -2364,30 +2379,25 @@ CURRENT STATE:
 INITIAL ANALYSIS RESULTS:
 {initial_analysis}
 
-Proceed with optimization strategy based on the analysis above. Do NOT reload the design in either Vivado or RapidWright - both already have it loaded."""
-            }
+Proceed with optimization strategy based on the analysis above. Do NOT reload the design in either Vivado or RapidWright - both already have it loaded."""}
         ]
-
-        # If a deterministic phys_opt baseline already ran, tell the LLM the current
-        # in-memory state so it doesn't act on the stale pre-optimization numbers and
-        # only pursues changes that beat the baseline already saved to the output DCP.
+        # Tell the LLM the current best (already saved) so it only pursues improvements.
         if baseline_wns is not None:
             baseline_fmax = self.calculate_fmax(baseline_wns, self.clock_period)
             fmax_str = f" (fmax: {baseline_fmax:.2f} MHz)" if baseline_fmax is not None else ""
             self.messages.append({
                 "role": "user",
                 "content": (
-                    f"IMPORTANT UPDATE: A deterministic phys_opt_design pass has ALREADY been "
-                    f"run on the open design. The CURRENT in-memory WNS is {baseline_wns:.3f} ns{fmax_str}, "
-                    f"and this baseline is ALREADY SAVED to the output DCP. Only commit further changes "
-                    f"if they IMPROVE on {baseline_wns:.3f} ns; if you cannot beat it, keep the current "
-                    f"result and finish. Do NOT re-run the same default phys_opt_design again."
+                    f"IMPORTANT UPDATE: Deterministic optimization has ALREADY been run on the open "
+                    f"design. The CURRENT in-memory WNS is {baseline_wns:.3f} ns{fmax_str}, and this "
+                    f"baseline is ALREADY SAVED to the output DCP. Only commit further changes if they "
+                    f"IMPROVE on {baseline_wns:.3f} ns; if you cannot beat it, keep the current result "
+                    f"and finish."
                 )
             })
-        
-        max_iterations = 50  # Safety limit
-        llm_stage_start = self._elapsed()
 
+        max_iterations = self.iteration + 50  # safety limit (relative, in case called again)
+        llm_stage_start = self._elapsed()
         print(f"=== Starting LLM-Driven Optimization (budget: {self.llm_timeout}s, "
               f"${self.cost_cap:.2f}, {self._remaining_total():.0f}s of 1hr left) ===\n")
 
@@ -2406,21 +2416,15 @@ Proceed with optimization strategy based on the analysis above. Do NOT reload th
 
             self.iteration += 1
             logger.info(f"=== Iteration {self.iteration} ===")
-
             try:
                 response_text, is_done = await self.get_completion()
                 print(f"\n{response_text}\n")
-
                 if is_done:
-                    logger.info("Optimization workflow completed")
+                    logger.info("LLM stage signaled completion")
                     await self.finalize_output(output_dcp)
-                    self.end_time = time.time()
-                    self._print_optimization_summary()
-                    return True
-
+                    return
             except Exception as e:
-                logger.exception(f"Error during optimization: {e}")
-                # Add error context to conversation
+                logger.exception(f"Error during LLM optimization: {e}")
                 self.messages.append({
                     "role": "user",
                     "content": f"An error occurred: {e}. Please verify your approach and continue or report if unrecoverable."
@@ -2430,11 +2434,7 @@ Proceed with optimization strategy based on the analysis above. Do NOT reload th
         print(f"\n⏱ LLM stage stopped: {stop_reason or 'reached maximum iterations'}\n")
         # Guarantee the output DCP is the best design (never worse than the baseline).
         await self.finalize_output(output_dcp)
-        self.end_time = time.time()
-        self._print_optimization_summary(max_iterations_reached=True)
-        # A protected baseline still exists, so the run produced a valid, improved
-        # submission even though the LLM did not signal completion.
-        return self.protected_best_dcp is not None
+        return
     
     def save_token_usage_report(self, output_path: Path):
         """Save detailed token usage report to JSON file."""
@@ -3980,11 +3980,13 @@ Examples:
         "--pre-opt",
         type=str,
         default="phys_opt,relocate,pblock,cell_replace,reimpl",
-        help="Comma-separated deterministic steps to run (in order) before the LLM stage. "
-             "Supported: phys_opt, relocate, pblock, cell_replace, reimpl, retime, relocate_rw, none. "
-             "'reimpl' (fresh from-scratch place/route) runs LAST as a final fallback and is kept only "
-             "if it beats the incremental steps. 'retime' is available but OFF by default (no measured "
-             "gain on tested benchmarks and it competes with reimpl for the 1hr budget). "
+        help="Comma-separated pipeline steps to run (in order). Supported: phys_opt, llm, relocate, "
+             "pblock, cell_replace, reimpl, retime, relocate_rw, none. 'llm' is now a POSITIONABLE "
+             "step: place it early (e.g. 'phys_opt,llm,relocate,pblock,cell_replace,reimpl') so the "
+             "LLM works right after phys_opt and is never squeezed by the slow deterministic stages; "
+             "if 'llm' is omitted (and --skip-llm is not set) the LLM still runs as the trailing phase. "
+             "'reimpl' (fresh from-scratch place/route) is kept only if it beats the incremental steps. "
+             "'retime' is OFF by default (no measured gain, competes for budget). "
              "Default: 'phys_opt,relocate,pblock,cell_replace,reimpl'."
     )
     parser.add_argument(
