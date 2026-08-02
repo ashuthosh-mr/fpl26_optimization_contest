@@ -691,16 +691,19 @@ def report_utilization_for_pblock(timeout: float = 300.0) -> str:
     
     lines = report.split('\n')
     for line in lines:
-        # Look for slice logic section
-        if '| Slice LUTs' in line or '| LUT as Logic' in line:
+        # Look for slice logic section.
+        # UltraScale+ (e.g. xcvu3p) reports "CLB LUTs"/"CLB Registers"; 7-series
+        # and UltraScale report "Slice LUTs"/"Slice Registers". Match both so the
+        # pblock stage is not silently skipped (LUT==0) on UltraScale+ parts.
+        if '| CLB LUTs' in line or '| Slice LUTs' in line or '| LUT as Logic' in line:
             parts = line.split('|')
             if len(parts) >= 3:
                 try:
                     resources["LUT"] = int(parts[2].strip().split()[0])
                 except:
                     pass
-        
-        if '| Register as Flip Flop' in line or '| Slice Registers' in line:
+
+        if '| CLB Registers' in line or '| Register as Flip Flop' in line or '| Slice Registers' in line:
             parts = line.split('|')
             if len(parts) >= 3:
                 try:
