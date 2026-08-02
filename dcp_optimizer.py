@@ -566,7 +566,7 @@ class DCPOptimizer(DCPOptimizerBase):
         model: str = DEFAULT_MODEL,
         debug: bool = False,
         run_dir: Optional[Path] = None,
-        pre_opt: str = "phys_opt,pblock,relocate,cell_replace,reimpl",
+        pre_opt: str = "phys_opt,pblock,relocate,cell_replace,pinopt,reimpl",
         physopt_directive: str = "",
         pblock_mode: str = "always",
         cell_replace_mode: str = "auto",
@@ -1209,6 +1209,57 @@ class DCPOptimizer(DCPOptimizerBase):
             await self.call_tool("vivado_open_checkpoint", {
                 "dcp_path": str(self.protected_best_dcp.resolve())})
             print("✓ Restored fallback into Vivado.\n")
+        return None
+
+    async def run_pinopt_baseline(self, output_dcp: Path, timeout: Optional[int] = None) -> Optional[float]:
+        """CHEAP deterministic optimization: phys_opt_design -critical_pin_opt.
+
+        Runs ONLY the critical-pin-swap slice of phys_opt -- it remaps critical LUT
+        input pins to faster pins (and adjusts the LUT INIT accordingly), which is
+        function-preserving and keeps the design placed-and-routed incrementally. No
+        full place, no full route. Costs ~1-2 min even on large designs (measured ~68s
+        on VTR/8k SLICEs), so it fits designs where a full phys_opt is too expensive,
+        and it re-optimizes pins on whatever critical path the earlier stages produced.
+        Adopts only if it beats the protected baseline. Returns new WNS or None."""
+        print("\n=== Deterministic Optimization: critical pin opt (cheap) ===\n")
+        wns_before = self.best_wns if self.best_wns > float('-inf') else self.initial_wns
+        rt = int(timeout) if timeout else 300
+        print(f"Running phys_opt_design -critical_pin_opt (timeout {rt}s)...")
+        await self.call_tool("vivado_run_tcl", {
+            "command": "phys_opt_design -critical_pin_opt", "timeout": rt})
+
+        await self.call_tool("vivado_report_timing_summary", {})
+        wns_after = self.best_wns if self.best_wns > float('-inf') else None
+
+        # Adopt only if strictly better than the protected fallback (pin swaps are
+        # function-preserving and shouldn't regress; keep-if-better guards anyway).
+        if wns_after is not None and wns_after > self.protected_best_wns:
+            await self.call_tool("vivado_write_checkpoint", {
+                "dcp_path": str(output_dcp.resolve()), "force": True})
+            if self.protected_best_dcp is None:
+                self.protected_best_dcp = self.run_dir / "best_protected.dcp"
+            try:
+                shutil.copy2(output_dcp, self.protected_best_dcp)
+                self.protected_best_wns = wns_after
+            except Exception as e:
+                logger.warning(f"Could not update protected baseline copy: {e}")
+            if wns_after > self.best_wns:
+                self.best_wns = wns_after
+            delta = (wns_after - wns_before) if wns_before is not None else 0.0
+            fmax_after = self.calculate_fmax(wns_after, self.clock_period)
+            fmax_str = f", fmax: {fmax_after:.2f} MHz" if fmax_after is not None else ""
+            print(f"✓ critical_pin_opt improved WNS {wns_before:.3f} → {wns_after:.3f} ns "
+                  f"(Δ {delta:+.3f} ns{fmax_str}). Saving as new baseline.\n")
+            return wns_after
+
+        cur = f"{wns_after:.3f} ns" if wns_after is not None else "unmeasurable"
+        print(f"⚠ critical_pin_opt ({cur}) did not beat baseline "
+              f"({self.protected_best_wns:.3f} ns); keeping baseline.")
+        if (self.protected_best_dcp is not None and self.protected_best_dcp.exists()
+                and (wns_after is None or wns_after < self.protected_best_wns)):
+            await self.call_tool("vivado_open_checkpoint", {
+                "dcp_path": str(self.protected_best_dcp.resolve())})
+            print("✓ Restored baseline into Vivado.\n")
         return None
 
     @staticmethod
@@ -2312,6 +2363,8 @@ set fh [open {%RESULT%} w]; puts $fh $r; close $fh
                     print(f"⏱ Manual-opt phase budget exhausted; skipping '{step}'.\n")
                     continue
                 budget = int(min(manual_left, remaining - 30))
+            elif step == "pinopt":  # cheap: targeted critical-pin swaps only (~2 min); small cap
+                budget = int(min(300, remaining - 30))
             elif step == "reimpl":  # final fallback: its own (larger) dedicated budget
                 budget = int(min(self.reimpl_timeout, remaining - 30))
             elif step == "llm":  # LLM stage self-limits via llm_timeout; budget here is informational
@@ -2322,6 +2375,8 @@ set fh [open {%RESULT%} w]; puts $fh $r; close $fh
             try:
                 if step == "phys_opt":
                     await self.run_physopt_baseline(output_dcp, timeout=budget)
+                elif step == "pinopt":
+                    await self.run_pinopt_baseline(output_dcp, timeout=budget)
                 elif step == "relocate":
                     await self.run_relocate_baseline(output_dcp, timeout=budget)
                 elif step == "relocate_rw":
@@ -3993,15 +4048,17 @@ Examples:
     parser.add_argument(
         "--pre-opt",
         type=str,
-        default="phys_opt,pblock,relocate,cell_replace,reimpl",
-        help="Comma-separated pipeline steps to run (in order). Supported: phys_opt, llm, relocate, "
-             "pblock, cell_replace, reimpl, retime, relocate_rw, none. 'llm' is now a POSITIONABLE "
-             "step: place it early (e.g. 'phys_opt,llm,relocate,pblock,cell_replace,reimpl') so the "
-             "LLM works right after phys_opt and is never squeezed by the slow deterministic stages; "
+        default="phys_opt,pblock,relocate,cell_replace,pinopt,reimpl",
+        help="Comma-separated pipeline steps to run (in order). Supported: phys_opt, pinopt, llm, "
+             "relocate, pblock, cell_replace, reimpl, retime, relocate_rw, none. 'llm' is now a "
+             "POSITIONABLE step: place it early (e.g. 'phys_opt,llm,relocate,pblock,cell_replace,reimpl') "
+             "so the LLM works right after phys_opt and is never squeezed by the slow deterministic stages; "
              "if 'llm' is omitted (and --skip-llm is not set) the LLM still runs as the trailing phase. "
+             "'pinopt' (phys_opt_design -critical_pin_opt) is a CHEAP (~2 min) function-preserving pin-swap "
+             "pass -- good for large designs where a full phys_opt is too expensive. "
              "'reimpl' (fresh from-scratch place/route) is kept only if it beats the incremental steps. "
              "'retime' is OFF by default (no measured gain, competes for budget). "
-             "Default: 'phys_opt,pblock,relocate,cell_replace,reimpl'."
+             "Default: 'phys_opt,pblock,relocate,cell_replace,pinopt,reimpl'."
     )
     parser.add_argument(
         "--physopt-directive",
