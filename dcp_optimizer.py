@@ -575,6 +575,7 @@ class DCPOptimizer(DCPOptimizerBase):
         reimpl_mode: str = "always",
         reimpl_place_directive: str = "ExtraTimingOpt",
         reimpl_route_directive: str = "AggressiveExplore",
+        reimpl_skip_if_recovered: float = 0.30,
         skip_llm: bool = False,
         phys_opt_timeout: int = 1200,
         manual_timeout: int = 1200,
@@ -599,6 +600,9 @@ class DCPOptimizer(DCPOptimizerBase):
         self.reimpl_mode = reimpl_mode            # auto | always | never (final fallback stage)
         self.reimpl_place_directive = reimpl_place_directive  # place_design directive for re-impl
         self.reimpl_route_directive = reimpl_route_directive  # route_design directive for re-impl
+        # Skip re-impl once the incremental stages have recovered this fraction of the
+        # initial slack deficit (re-impl only wins from a weak incremental result).
+        self.reimpl_skip_if_recovered = reimpl_skip_if_recovered
         self.skip_llm = skip_llm                  # stop after deterministic baseline
         # Wall-clock budgets (seconds) and cost cap ($). Contest limit: 1 hr + $1/benchmark.
         # Phased 20/20/20: phys_opt | manual (pblock + cell_replace SHARE this) | LLM.
@@ -2043,6 +2047,32 @@ set fh [open {%RESULT%} w]; puts $fh $r; close $fh
             print("No golden input available to re-solve; skipping re-impl.\n")
             return None
 
+        # GAIN GATE: re-impl is the most expensive stage in the pipeline (it re-places and
+        # re-routes the whole design from scratch, ~4 min on amd and far more on large
+        # designs). Empirically it only WINS when the incremental stages barely moved --
+        # it is an escape from a bad local basin, not a polisher:
+        #   rosetta   recovered 10% of its slack deficit incrementally -> re-impl WON (-0.967 -> -0.887)
+        #   amd       recovered 49% -> re-impl LOST (-0.858 vs -0.904), 250s wasted (53% of runtime)
+        #   logicnets recovered 57% -> re-impl LOST badly (-0.417 vs -1.161)
+        # Runtime is scored (gamma = runtime/3600 costs 0.1*alpha, i.e. ~0.17 MHz per minute
+        # at alpha=100), so burning minutes on a stage that will revert is a direct score
+        # loss. Skip re-impl once the incremental stages have already closed a large share
+        # of the initial negative slack. Tunable via --reimpl-skip-if-recovered.
+        skip_frac = getattr(self, "reimpl_skip_if_recovered", 0.30)
+        if (skip_frac > 0 and self.initial_wns is not None and self.initial_wns < 0
+                and self.protected_best_wns > float('-inf')):
+            recovered = (self.protected_best_wns - self.initial_wns) / (-self.initial_wns)
+            if recovered >= skip_frac:
+                print(f"re-impl skipped: incremental stages already recovered "
+                      f"{recovered*100:.1f}% of the initial slack deficit "
+                      f"(WNS {self.initial_wns:.3f} -> {self.protected_best_wns:.3f} ns, "
+                      f"threshold {skip_frac*100:.0f}%). A fresh re-implementation only wins "
+                      f"from a weak incremental result, and its runtime is scored.\n")
+                logger.info(f"re-impl gain-gated: recovered {recovered:.3f} >= {skip_frac}")
+                return None
+            print(f"re-impl proceeding: incremental stages recovered only "
+                  f"{recovered*100:.1f}% of the slack deficit (< {skip_frac*100:.0f}% threshold).")
+
         budget = int(timeout) if timeout else 2400
         place_dir = getattr(self, "reimpl_place_directive", "ExtraTimingOpt") or "ExtraTimingOpt"
         route_dir = getattr(self, "reimpl_route_directive", "AggressiveExplore") or "AggressiveExplore"
@@ -2245,6 +2275,19 @@ set fh [open {%RESULT%} w]; puts $fh $r; close $fh
         print("✓ Restored protected baseline into Vivado.\n")
         return None
 
+    def _restore_baseline_as_newest(self, output_dcp: Path):
+        """Copy the protected baseline over the output DCP and make it the NEWEST file.
+
+        shutil.copy2 preserves the source mtime, so a plain copy2 would stamp the scored
+        file with the time the baseline was originally written -- which can be OLDER than
+        a leftover *_optimized*.dcp from a previous run. The contest picks the
+        most-recently-modified match, so bump the mtime to now after copying."""
+        shutil.copy2(self.protected_best_dcp, output_dcp)
+        try:
+            os.utime(output_dcp, None)  # mtime = now; this file must win the newest-match rule
+        except Exception as e:
+            logger.warning(f"Could not refresh output DCP mtime: {e}")
+
     async def finalize_output(self, output_dcp: Path):
         """Guarantee the scored output DCP is never worse than the protected best.
 
@@ -2256,11 +2299,32 @@ set fh [open {%RESULT%} w]; puts $fh $r; close $fh
         if self.protected_best_dcp is None or not self.protected_best_dcp.exists():
             return  # no baseline to protect (pre_opt disabled or copy failed)
 
+        # ROUTE GATE: a design that is not fully routed reports an OPTIMISTIC WNS
+        # (missing route delays), so it can "beat" the protected best on paper and then
+        # score ZERO -- the official validation requires a fully placed-and-routed design.
+        # Every adopting stage checks this; the final write must too, since this function
+        # decides which file actually gets scored. If the in-memory design is not clean
+        # (e.g. the LLM left it mid-edit), fall straight back to the protected baseline.
         try:
-            current_wns = await super().get_wns_for_target_clock(self._call_vivado_tool)
+            route_status = await self.call_tool("vivado_report_route_status", {})
+            fully_routed = (("fully routed" in route_status.lower())
+                            or ("100.00%" in route_status))
         except Exception as e:
-            logger.warning(f"finalize: could not measure current WNS ({e}); restoring baseline")
+            logger.warning(f"finalize: could not read route status ({e}); restoring baseline")
+            fully_routed = False
+
+        if not fully_routed:
+            logger.info("finalize: in-memory design is NOT fully routed; "
+                        "restoring protected baseline as final output")
+            print("⚠ Final in-memory design is not fully routed; restoring the protected "
+                  "(routed) baseline as the scored output.")
             current_wns = None
+        else:
+            try:
+                current_wns = await super().get_wns_for_target_clock(self._call_vivado_tool)
+            except Exception as e:
+                logger.warning(f"finalize: could not measure current WNS ({e}); restoring baseline")
+                current_wns = None
 
         if current_wns is not None and current_wns > self.protected_best_wns:
             logger.info(f"finalize: current design ({current_wns:.3f} ns) beats protected best "
@@ -2273,12 +2337,12 @@ set fh [open {%RESULT%} w]; puts $fh $r; close $fh
                 self.protected_best_wns = current_wns
             except Exception as e:
                 logger.warning(f"finalize: writing improved output failed ({e}); restoring baseline")
-                shutil.copy2(self.protected_best_dcp, output_dcp)
+                self._restore_baseline_as_newest(output_dcp)
         else:
             cur_str = f"{current_wns:.3f}" if current_wns is not None else "unknown"
             logger.info(f"finalize: current design ({cur_str} ns) does not beat protected best "
                         f"({self.protected_best_wns:.3f} ns); restoring protected baseline as final output")
-            shutil.copy2(self.protected_best_dcp, output_dcp)
+            self._restore_baseline_as_newest(output_dcp)
         print(f"✓ Final output DCP guaranteed at WNS {self.protected_best_wns:.3f} ns "
               f"(never worse than the deterministic baseline): {output_dcp}")
 
@@ -4096,6 +4160,12 @@ Examples:
                         help="place_design directive for the re-impl stage (default: ExtraTimingOpt)")
     parser.add_argument("--reimpl-route-directive", type=str, default="AggressiveExplore",
                         help="route_design directive for the re-impl stage (default: AggressiveExplore)")
+    parser.add_argument("--reimpl-skip-if-recovered", type=float, default=0.30,
+                        help="Skip the re-impl stage if the incremental stages already recovered "
+                             "this FRACTION of the initial negative slack (default: 0.30). Re-impl "
+                             "only wins when the incremental result is weak (rosetta: 10%% recovered "
+                             "-> re-impl won; amd: 49%% -> lost, 250s wasted), and its runtime is "
+                             "scored (gamma). Set 0 to always run it.")
     parser.add_argument("--reimpl-timeout", type=int, default=2400,
                         help="Wall-clock budget (s) for the re-impl fallback stage (default: 2400 = 40 min)")
     parser.add_argument("--phys-opt-timeout", type=int, default=1200,
@@ -4197,6 +4267,7 @@ Examples:
         reimpl_mode=args.reimpl_mode,
         reimpl_place_directive=args.reimpl_place_directive,
         reimpl_route_directive=args.reimpl_route_directive,
+        reimpl_skip_if_recovered=args.reimpl_skip_if_recovered,
         skip_llm=args.skip_llm,
         phys_opt_timeout=args.phys_opt_timeout,
         manual_timeout=args.manual_timeout,
