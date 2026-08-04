@@ -2346,6 +2346,37 @@ set fh [open {%RESULT%} w]; puts $fh $r; close $fh
         print(f"✓ Final output DCP guaranteed at WNS {self.protected_best_wns:.3f} ns "
               f"(never worse than the deterministic baseline): {output_dcp}")
 
+        # EQUIVALENCE GATE (last line of defense): route+WNS checks do NOT catch a
+        # non-equivalent netlist. A stage can adopt a result that is routed and has a
+        # good WNS yet is functionally BROKEN -- observed on corescore, where the
+        # RapidWright cell_replace round-trip (optimize_cell_placement -> write_checkpoint
+        # -> re-route) produced a design that passed route+WNS but FAILED Phase-2
+        # simulation. Such a file scores ZERO on the official validator (disqualified).
+        # Validate the actual scored file; if it fails, fall back to the ORIGINAL input
+        # (self._golden_input), which is trivially equivalent -- a valid 0-improvement
+        # submission beats a high-WNS design that gets disqualified.
+        # (Future: fall back to the last construction-safe checkpoint instead of the
+        # original, to preserve the pure-Vivado placement gains.)
+        if self._golden_input is not None and Path(self._golden_input).exists():
+            print("Validating the final scored DCP for functional equivalence...")
+            equiv = await self._validate_equivalence(
+                Path(self._golden_input), output_dcp, vectors=100)
+            if not equiv:
+                logger.warning("finalize: FINAL OUTPUT FAILED EQUIVALENCE -- a stage produced a "
+                               "non-equivalent design (route+WNS passed but simulation did not). "
+                               "Restoring the ORIGINAL input as the scored output so the submission "
+                               "is VALID (0 improvement) rather than disqualified.")
+                print("⚠ FINAL OUTPUT FAILED FUNCTIONAL EQUIVALENCE -- a stage (e.g. RapidWright "
+                      "cell_replace or the LLM) broke the netlist. Restoring the ORIGINAL input as "
+                      "the scored output: VALID with 0 improvement, NOT disqualified.")
+                try:
+                    shutil.copy2(Path(self._golden_input), output_dcp)
+                    os.utime(output_dcp, None)  # must be the newest matching file
+                except Exception as e:
+                    logger.warning(f"finalize: could not restore original input as output ({e})")
+            else:
+                print("✓ Final scored DCP PASSED functional equivalence.")
+
     async def optimize(self, input_dcp: Path, output_dcp: Path) -> bool:
         """Run the optimization workflow."""
         # Start timing the optimization process
