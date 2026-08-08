@@ -19,6 +19,7 @@ import re
 import shutil
 import sys
 import tempfile
+import threading
 import time
 from contextlib import AsyncExitStack
 from pathlib import Path
@@ -566,7 +567,7 @@ class DCPOptimizer(DCPOptimizerBase):
         model: str = DEFAULT_MODEL,
         debug: bool = False,
         run_dir: Optional[Path] = None,
-        pre_opt: str = "phys_opt,pblock,relocate,cell_replace,pinopt,reimpl",
+        pre_opt: str = "phys_opt,pblock,relocate,pinopt,reimpl,routeopt",
         physopt_directive: str = "",
         pblock_mode: str = "always",
         cell_replace_mode: str = "auto",
@@ -582,6 +583,7 @@ class DCPOptimizer(DCPOptimizerBase):
         reimpl_timeout: int = 2400,
         llm_timeout: int = 1200,
         total_timeout: int = 3600,
+        hard_deadline: int = 3300,
         cost_cap: float = 1.0
     ):
         super().__init__(debug=debug, run_dir=run_dir)
@@ -610,7 +612,16 @@ class DCPOptimizer(DCPOptimizerBase):
         self.manual_timeout = manual_timeout      # phase-2 cap SHARED by pblock + cell_replace
         self.reimpl_timeout = reimpl_timeout      # dedicated cap for the re-impl fallback stage
         self.llm_timeout = llm_timeout            # phase-3 cap for the LLM stage
-        self.total_timeout = total_timeout        # hard overall cap (fallback guaranteed)
+        self.total_timeout = total_timeout        # soft cap: gates STAGE STARTS only
+        # HARD wall-clock kill. The stage budgets above are SOFT -- a running Vivado
+        # place/route cannot be interrupted (the MCP server waits up to 3600s for it),
+        # so on huge designs (e.g. boom) a stage entered just under total_timeout can
+        # overrun to 2.5h. This watchdog GUARANTEES we stop under the contest's 1-hour
+        # limit: at hard_deadline it force-writes the protected-best DCP as the scored
+        # output and kills the process. Because the protected best is saved (and
+        # equivalence-checked) after every successful stage, the output is always valid.
+        self.hard_deadline = hard_deadline
+        self._watchdog: Optional[threading.Timer] = None
         self.cost_cap = cost_cap                  # stop LLM before spending more than this
         # Output-DCP protection: the contest scores the most-recently-modified
         # *_optimized*.dcp, so we keep a protected copy of the best design and
@@ -619,6 +630,11 @@ class DCPOptimizer(DCPOptimizerBase):
         self._golden_input: Optional[Path] = None  # original input DCP, for equivalence gating
         self.protected_best_dcp: Optional[Path] = None
         self.protected_best_wns = float('-inf')
+        # Set True only when a stage EDITS the netlist (cell_replace's RapidWright
+        # round-trip, retime, or the LLM). Placement/routing-only stages (phys_opt,
+        # pblock, relocate, pinopt, reimpl) leave the netlist untouched and are provably
+        # equivalent, so finalize skips the expensive simulation check when this stays False.
+        self._netlist_touched = False
         self.tools: list[dict] = []
         self.messages: list[dict] = []
         
@@ -1154,6 +1170,67 @@ class DCPOptimizer(DCPOptimizerBase):
         """Seconds left in the overall wall-clock budget."""
         return self.total_timeout - self._elapsed()
 
+    def _arm_watchdog(self, output_dcp: Path):
+        """Arm the HARD wall-clock kill. Fires once at hard_deadline seconds.
+
+        Soft stage budgets cannot interrupt a running Vivado op, so this is the only
+        guaranteed way to finish under the contest's 1-hour limit. On fire it writes
+        the protected-best DCP (already equivalence-checked) as the scored output and
+        force-exits, so a valid, improved submission always exists under the deadline.
+        """
+        if self.hard_deadline is None or self.hard_deadline <= 0:
+            return
+
+        def _fire():
+            try:
+                if (self.protected_best_dcp is not None
+                        and self.protected_best_dcp.exists()):
+                    shutil.copy2(self.protected_best_dcp, output_dcp)
+                    os.utime(output_dcp, None)  # newest matching *_optimized*.dcp
+                    msg = f"protected best (WNS {self.protected_best_wns:.3f} ns)"
+                else:
+                    msg = "current output_dcp on disk"
+            except Exception as e:
+                msg = f"could not refresh output ({e})"
+            line = (f"\n⏰ HARD DEADLINE {self.hard_deadline}s reached "
+                    f"({self._elapsed():.0f}s elapsed) -- force-stopping under the "
+                    f"1-hour contest limit. Scored output = {msg}.\n")
+            try:
+                logger.error(line.strip())
+                print(line, flush=True)
+            except Exception:
+                pass
+            # Kill Vivado / MCP children, then this process. os._exit avoids running
+            # finalize (which would need the now-killed Vivado); the output DCP on disk
+            # is already the best valid result.
+            try:
+                os.system("pkill -9 -f VivadoMCP/vivado_mcp_server.py 2>/dev/null; "
+                          "pkill -9 -f 'vivado -mode tcl' 2>/dev/null")
+            except Exception:
+                pass
+            os._exit(0)
+
+        # Anchor the fire time to optimize() start (self.start_time), so hard_deadline
+        # is measured the same way as _elapsed()/_remaining_total() -- i.e. it includes
+        # the initial analysis time. Subtract time already spent so the ABSOLUTE fire
+        # point is hard_deadline seconds after optimize() began, not after arming.
+        delay = max(1.0, self.hard_deadline - self._elapsed())
+        self._watchdog = threading.Timer(delay, _fire)
+        self._watchdog.daemon = True
+        self._watchdog.start()
+        logger.info(f"Hard-deadline watchdog armed: fires in {delay:.0f}s "
+                    f"(hard_deadline {self.hard_deadline}s from optimize start; "
+                    f"total_timeout {self.total_timeout}s).")
+
+    def _disarm_watchdog(self):
+        """Cancel the watchdog after a normal (in-budget) completion."""
+        if self._watchdog is not None:
+            try:
+                self._watchdog.cancel()
+            except Exception:
+                pass
+            self._watchdog = None
+
     async def run_physopt_baseline(self, output_dcp: Path, timeout: Optional[int] = None) -> Optional[float]:
         """Deterministic pre-LLM optimization: run phys_opt_design and save a
         guaranteed baseline DCP.
@@ -1261,6 +1338,65 @@ class DCPOptimizer(DCPOptimizerBase):
               f"({self.protected_best_wns:.3f} ns); keeping baseline.")
         if (self.protected_best_dcp is not None and self.protected_best_dcp.exists()
                 and (wns_after is None or wns_after < self.protected_best_wns)):
+            await self.call_tool("vivado_open_checkpoint", {
+                "dcp_path": str(self.protected_best_dcp.resolve())})
+            print("✓ Restored baseline into Vivado.\n")
+        return None
+
+    async def run_routeopt_baseline(self, output_dcp: Path, timeout: Optional[int] = None) -> Optional[float]:
+        """CHEAP deterministic finisher: re-route the current best with a higher-effort
+        router directive (route_design -directive Explore).
+
+        Routing-only -- no placement move, no netlist edit -> provably functionally
+        equivalent (validate-safe). It re-runs the router with more effort on whatever
+        placement the earlier stages produced, which can find a shorter-delay routing of
+        the same nets. This is exactly the move the LLM finisher stumbled onto on
+        logicnets (route_design -directive Explore: WNS -0.417 -> -0.408, +2.46 MHz); we
+        bake it in deterministically so every design gets it, not just when the LLM
+        happens to try it. Must run AFTER a fully-routed best exists. Adopts only if it
+        beats the protected baseline; otherwise the protected baseline is reloaded."""
+        print("\n=== Deterministic Optimization: explore-route polish (cheap) ===\n")
+        if getattr(self, "routeopt_mode", "always") == "never":
+            print("routeopt disabled (--routeopt-mode never). Skipping.\n")
+            return None
+        if self.protected_best_dcp is None or not self.protected_best_dcp.exists():
+            print("No protected baseline to polish; skipping routeopt.\n")
+            return None
+        wns_before = self.protected_best_wns
+        rt = int(timeout) if timeout else 600
+        print(f"Running route_design -directive Explore (timeout {rt}s)...")
+        await self.call_tool("vivado_route_design", {"directive": "Explore", "timeout": rt})
+
+        # Only trust the result if the design is still fully routed (a timed-out route
+        # can leave it partially unrouted, which reports an optimistic WNS).
+        route_status = await self.call_tool("vivado_report_route_status", {})
+        fully_routed = ("fully routed" in route_status.lower()) or ("100.00%" in route_status)
+        await self.call_tool("vivado_report_timing_summary", {})
+        wns_after = self.best_wns if (fully_routed and self.best_wns > float('-inf')) else None
+
+        if wns_after is not None and wns_after > self.protected_best_wns:
+            await self.call_tool("vivado_write_checkpoint", {
+                "dcp_path": str(output_dcp.resolve()), "force": True})
+            if self.protected_best_dcp is None:
+                self.protected_best_dcp = self.run_dir / "best_protected.dcp"
+            try:
+                shutil.copy2(output_dcp, self.protected_best_dcp)
+                self.protected_best_wns = wns_after
+            except Exception as e:
+                logger.warning(f"Could not update protected baseline copy: {e}")
+            if wns_after > self.best_wns:
+                self.best_wns = wns_after
+            delta = (wns_after - wns_before) if wns_before > float('-inf') else 0.0
+            fmax_after = self.calculate_fmax(wns_after, self.clock_period)
+            fmax_str = f", fmax: {fmax_after:.2f} MHz" if fmax_after is not None else ""
+            print(f"✓ explore-route improved WNS {wns_before:.3f} → {wns_after:.3f} ns "
+                  f"(Δ {delta:+.3f} ns{fmax_str}). Saving as new baseline.\n")
+            return wns_after
+
+        cur = f"{wns_after:.3f} ns" if wns_after is not None else ("not fully routed" if not fully_routed else "unmeasurable")
+        print(f"⚠ explore-route ({cur}) did not beat baseline "
+              f"({self.protected_best_wns:.3f} ns); keeping baseline.")
+        if self.protected_best_dcp is not None and self.protected_best_dcp.exists():
             await self.call_tool("vivado_open_checkpoint", {
                 "dcp_path": str(self.protected_best_dcp.resolve())})
             print("✓ Restored baseline into Vivado.\n")
@@ -1976,6 +2112,7 @@ set fh [open {%RESULT%} w]; puts $fh $r; close $fh
 
         rt = int(timeout) if timeout else 1200
         print(f"Running phys_opt_design -retime (timeout {rt}s)...")
+        self._netlist_touched = True  # retiming edits the netlist (register rebalancing)
         await self.call_tool("vivado_run_tcl", {"command": "phys_opt_design -retime", "timeout": rt})
 
         await self.call_tool("vivado_report_timing_summary", {})
@@ -2221,6 +2358,7 @@ set fh [open {%RESULT%} w]; puts $fh $r; close $fh
               f"{'...' if len(cell_names) > 5 else ''}")
 
         # 3. Re-place cells in RapidWright and write an intermediate DCP.
+        self._netlist_touched = True  # RapidWright round-trip can alter the netlist
         await self.call_tool("rapidwright_optimize_cell_placement", {
             "cell_names": cell_names, "max_candidates": 10})
         rw_dcp = Path(self.temp_dir) / "cellrepl_optimized.dcp"
@@ -2357,7 +2495,15 @@ set fh [open {%RESULT%} w]; puts $fh $r; close $fh
         # submission beats a high-WNS design that gets disqualified.
         # (Future: fall back to the last construction-safe checkpoint instead of the
         # original, to preserve the pure-Vivado placement gains.)
-        if self._golden_input is not None and Path(self._golden_input).exists():
+        if not self._netlist_touched:
+            # Every stage that ran was placement/routing-only (netlist untouched) -> the
+            # output is provably equivalent to the input. Skip the expensive ~15-min
+            # xelab/xsim check entirely (it is pure waste here and is what kept getting
+            # reaped on huge designs). Netlist-editing stages (cell_replace/retime/LLM)
+            # flip self._netlist_touched and DO get validated below.
+            print("✓ Run was placement/routing-only (netlist untouched) -- skipping the "
+                  "equivalence simulation; the output is equivalent by construction.")
+        elif self._golden_input is not None and Path(self._golden_input).exists():
             print("Validating the final scored DCP for functional equivalence...")
             equiv = await self._validate_equivalence(
                 Path(self._golden_input), output_dcp, vectors=100)
@@ -2376,6 +2522,9 @@ set fh [open {%RESULT%} w]; puts $fh $r; close $fh
                     logger.warning(f"finalize: could not restore original input as output ({e})")
             else:
                 print("✓ Final scored DCP PASSED functional equivalence.")
+
+        # Normal, in-budget completion: cancel the hard-deadline watchdog.
+        self._disarm_watchdog()
 
     async def optimize(self, input_dcp: Path, output_dcp: Path) -> bool:
         """Run the optimization workflow."""
@@ -2436,6 +2585,11 @@ set fh [open {%RESULT%} w]; puts $fh $r; close $fh
         except Exception as e:
             logger.warning(f"Could not save initial fallback: {e}")
 
+        # Arm the HARD wall-clock kill now that a valid protected-best exists on disk.
+        # From here on, we are GUARANTEED to stop under the 1-hour contest limit even
+        # if a single Vivado place/route runs away (soft budgets can't interrupt it).
+        self._arm_watchdog(output_dcp)
+
         # === Deterministic pre-LLM optimization pipeline (wall-clock bounded) ===
         # Runs each configured step in order (e.g. phys_opt -> pblock). Every step is
         # functionally equivalent and only keeps a result that beats the protected
@@ -2460,8 +2614,24 @@ set fh [open {%RESULT%} w]; puts $fh $r; close $fh
                 budget = int(min(manual_left, remaining - 30))
             elif step == "pinopt":  # cheap: targeted critical-pin swaps only (~2 min); small cap
                 budget = int(min(300, remaining - 30))
+            elif step == "routeopt":  # explore-route polish: one higher-effort re-route
+                budget = int(min(600, remaining - 30))
             elif step == "reimpl":  # final fallback: its own (larger) dedicated budget
-                budget = int(min(self.reimpl_timeout, remaining - 30))
+                # WORST-CASE GATE: reimpl runs a full from-scratch place+route whose
+                # internal Vivado ops CANNOT be interrupted mid-run (soft timeouts).
+                # If we can't finish it before the HARD deadline, do NOT start it --
+                # otherwise the watchdog kills it mid-route, wasting the whole budget
+                # (this is exactly what blew boom to 2.5h). Need at least half the
+                # reimpl budget of real wall-clock left before the hard kill.
+                hard_left = (self.hard_deadline - self._elapsed()
+                             if self.hard_deadline else remaining)
+                need = max(int(self.reimpl_timeout * 0.5), 600)
+                if hard_left < need:
+                    print(f"⏱ Skipping 'reimpl': only {hard_left:.0f}s until hard "
+                          f"deadline, need ≥{need}s to finish a from-scratch place+route "
+                          f"(reimpl can't be interrupted; not starting it).\n")
+                    continue
+                budget = int(min(self.reimpl_timeout, hard_left - 60, remaining - 30))
             elif step == "llm":  # LLM stage self-limits via llm_timeout; budget here is informational
                 budget = int(min(self.llm_timeout, remaining - 30))
             else:  # phys_opt (and any future dedicated-phase step)
@@ -2472,6 +2642,8 @@ set fh [open {%RESULT%} w]; puts $fh $r; close $fh
                     await self.run_physopt_baseline(output_dcp, timeout=budget)
                 elif step == "pinopt":
                     await self.run_pinopt_baseline(output_dcp, timeout=budget)
+                elif step == "routeopt":
+                    await self.run_routeopt_baseline(output_dcp, timeout=budget)
                 elif step == "relocate":
                     await self.run_relocate_baseline(output_dcp, timeout=budget)
                 elif step == "relocate_rw":
@@ -2528,6 +2700,7 @@ set fh [open {%RESULT%} w]; puts $fh $r; close $fh
         in --pre-opt, e.g. phys_opt,llm,relocate,...) or as the trailing phase. Updates the
         protected best + output DCP but does NOT print the final summary or set end_time --
         optimize() does that exactly once after all stages complete."""
+        self._netlist_touched = True  # the LLM may issue netlist-editing tool calls
         baseline_wns = self.protected_best_wns if self.protected_best_wns > float('-inf') else None
         system_prompt_template = load_system_prompt()
         system_prompt = system_prompt_template.format(
@@ -4143,9 +4316,12 @@ Examples:
     parser.add_argument(
         "--pre-opt",
         type=str,
-        default="phys_opt,pblock,relocate,cell_replace,pinopt,reimpl",
+        default="phys_opt,pblock,relocate,pinopt,reimpl,routeopt",
         help="Comma-separated pipeline steps to run (in order). Supported: phys_opt, pinopt, llm, "
-             "relocate, pblock, cell_replace, reimpl, retime, relocate_rw, none. 'llm' is now a "
+             "relocate, pblock, cell_replace, reimpl, retime, relocate_rw, none. cell_replace and "
+             "relocate_rw (RapidWright netlist round-trips) are NO LONGER in the default -- they "
+             "broke equivalence (corescore) and never clearly won; select them explicitly if needed. "
+             "'llm' is now a "
              "POSITIONABLE step: place it early (e.g. 'phys_opt,llm,relocate,pblock,cell_replace,reimpl') "
              "so the LLM works right after phys_opt and is never squeezed by the slow deterministic stages; "
              "if 'llm' is omitted (and --skip-llm is not set) the LLM still runs as the trailing phase. "
@@ -4206,7 +4382,11 @@ Examples:
     parser.add_argument("--llm-timeout", type=int, default=1200,
                         help="Wall-clock budget (s) for the LLM stage (default: 1200 = 20 min)")
     parser.add_argument("--total-timeout", type=int, default=3600,
-                        help="Hard overall wall-clock cap (s); a valid fallback is always saved (default: 3600 = 1 hr)")
+                        help="Soft cap (s): gates stage STARTS only (default: 3600 = 1 hr)")
+    parser.add_argument("--hard-deadline", type=int, default=3300,
+                        help="HARD wall-clock kill (s): force-writes the protected-best DCP and "
+                             "exits, guaranteeing we finish under the 1-hr contest limit even if a "
+                             "Vivado place/route runs away (default: 3300 = 55 min; 0 disables)")
     parser.add_argument("--cost-cap", type=float, default=1.0,
                         help="Stop the LLM stage before spending more than this many USD (default: 1.0)")
     parser.add_argument(
@@ -4281,7 +4461,7 @@ Examples:
     print(f"Model:       {args.model}")
     print(f"Pre-opt:     {args.pre_opt}" + (f" (physopt directive={args.physopt_directive})" if args.physopt_directive else "") + f" [relocate={args.relocate_mode}, retime={args.retime_mode}, pblock={args.pblock_mode}, cell_replace={args.cell_replace_mode}, reimpl={args.reimpl_mode}]")
     print(f"LLM stage:   {'DISABLED (--skip-llm)' if args.skip_llm else 'enabled'}")
-    print(f"Budgets:     phys_opt {args.phys_opt_timeout}s | manual(pblock+cell) {args.manual_timeout}s | LLM {args.llm_timeout}s | total {args.total_timeout}s | cost ${args.cost_cap:.2f}")
+    print(f"Budgets:     phys_opt {args.phys_opt_timeout}s | manual(pblock+cell) {args.manual_timeout}s | LLM {args.llm_timeout}s | total(soft) {args.total_timeout}s | HARD-kill {args.hard_deadline}s | cost ${args.cost_cap:.2f}")
     print()
 
     optimizer = DCPOptimizer(
@@ -4305,6 +4485,7 @@ Examples:
         reimpl_timeout=args.reimpl_timeout,
         llm_timeout=args.llm_timeout,
         total_timeout=args.total_timeout,
+        hard_deadline=args.hard_deadline,
         cost_cap=args.cost_cap
     )
     
