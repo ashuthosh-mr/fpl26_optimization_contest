@@ -38,8 +38,14 @@ endif
 # Points the Python rapidwright package to use the local RapidWright source
 # See: https://www.rapidwright.io/docs/Install_RapidWright_as_a_Python_PIP_Package.html#java-development-and-python
 RAPIDWRIGHT_PATH := $(CURDIR)/RapidWright
+# Only point at the LOCAL RapidWright build when it actually exists (built jars present).
+# A fresh submission unzip has no submodule/jars, so leave CLASSPATH/RAPIDWRIGHT_PATH UNSET
+# and let the pip 'rapidwright' package use its own bundled jars (verified: works standalone).
+# Forcing an empty local CLASSPATH otherwise breaks JPype ("Failed to import 'com.xilinx'").
+ifneq ($(wildcard $(RAPIDWRIGHT_PATH)/jars/*.jar),)
 export RAPIDWRIGHT_PATH
 export CLASSPATH := $(RAPIDWRIGHT_PATH)/bin:$(RAPIDWRIGHT_PATH)/jars/*
+endif
 
 # Benchmark archive from GitHub release
 BENCHMARK_VERSION := v1.1.0
@@ -218,15 +224,19 @@ setup:
 
 # Build RapidWright from source (git submodule)
 build-rapidwright:
-	@printf "$(COLOR_YELLOW)Building RapidWright from source...$(COLOR_RESET)\n"
+	@printf "$(COLOR_YELLOW)Building RapidWright from source (optional -- pip 'rapidwright' is the fallback)...$(COLOR_RESET)\n"
 	@if [ ! -f "$(RAPIDWRIGHT_PATH)/gradlew" ]; then \
-		printf "$(COLOR_YELLOW)Initializing RapidWright git submodule...$(COLOR_RESET)\n"; \
-		git submodule update --init RapidWright; \
+		if git rev-parse --git-dir >/dev/null 2>&1 && [ -f .gitmodules ]; then \
+			printf "$(COLOR_YELLOW)Initializing RapidWright git submodule...$(COLOR_RESET)\n"; \
+			git submodule update --init RapidWright || true; \
+		fi; \
 	fi
-	@cd "$(RAPIDWRIGHT_PATH)" && ./gradlew compileJava -p "$(RAPIDWRIGHT_PATH)"
-	@printf "$(COLOR_GREEN)✓ RapidWright built successfully$(COLOR_RESET)\n"
-	@printf "$(COLOR_GREEN)  RAPIDWRIGHT_PATH=$(RAPIDWRIGHT_PATH)$(COLOR_RESET)\n"
-	@printf "$(COLOR_GREEN)  CLASSPATH=$(CLASSPATH)$(COLOR_RESET)\n"
+	@if [ -f "$(RAPIDWRIGHT_PATH)/gradlew" ]; then \
+		cd "$(RAPIDWRIGHT_PATH)" && ./gradlew compileJava -p "$(RAPIDWRIGHT_PATH)" && \
+		printf "$(COLOR_GREEN)✓ RapidWright built from source$(COLOR_RESET)\n"; \
+	else \
+		printf "$(COLOR_YELLOW)⚠ No local RapidWright source (fresh unzip / no submodule); using the pip 'rapidwright' package (its own bundled jars). This is expected and supported.$(COLOR_RESET)\n"; \
+	fi
 
 # Run optimizer target: Run dcp_optimizer.py (output DCP name generated automatically)
 run_optimizer: 
