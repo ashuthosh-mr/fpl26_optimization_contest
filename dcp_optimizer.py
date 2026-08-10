@@ -111,6 +111,18 @@ def load_system_prompt() -> str:
         raise
 
 
+def load_planner_prompt() -> Optional[str]:
+    """Load the LLM-planner prompt from PLANNER_PROMPT.TXT. Returns None if missing
+    (the caller then falls back to the default deterministic recipe)."""
+    prompt_file = Path(__file__).parent.resolve() / "PLANNER_PROMPT.TXT"
+    try:
+        with open(prompt_file, 'r') as f:
+            return f.read()
+    except Exception as e:
+        logger.warning(f"Planner prompt not loadable ({e}); planner will fall back to default recipe.")
+        return None
+
+
 def convert_mcp_tool_to_openai(tool, server_prefix: str) -> dict:
     """Convert MCP tool definition to OpenAI-compatible format with server prefix."""
     schema = tool.inputSchema or {"type": "object", "properties": {}}
@@ -578,12 +590,13 @@ class DCPOptimizer(DCPOptimizerBase):
         reimpl_route_directive: str = "AggressiveExplore",
         reimpl_skip_if_recovered: float = 0.30,
         skip_llm: bool = False,
+        use_planner: bool = True,
         phys_opt_timeout: int = 1200,
         manual_timeout: int = 1200,
         reimpl_timeout: int = 2400,
         llm_timeout: int = 1200,
         total_timeout: int = 3600,
-        hard_deadline: int = 3300,
+        hard_deadline: int = 3420,
         cost_cap: float = 1.0
     ):
         super().__init__(debug=debug, run_dir=run_dir)
@@ -606,6 +619,12 @@ class DCPOptimizer(DCPOptimizerBase):
         # initial slack deficit (re-impl only wins from a weak incremental result).
         self.reimpl_skip_if_recovered = reimpl_skip_if_recovered
         self.skip_llm = skip_llm                  # stop after deterministic baseline
+        # LLM PLANNER (front): one up-front call reads the design diagnosis and picks the
+        # ordered recipe of OPTIONAL stages that run AFTER the mandatory phys_opt. Advisory
+        # only -- any failure falls back to the full default recipe, so the floor is never
+        # worse than the proven deterministic flow. Disabled by --skip-llm or --no-planner.
+        self.use_planner = use_planner
+        self._planner_ran = False
         # Wall-clock budgets (seconds) and cost cap ($). Contest limit: 1 hr + $1/benchmark.
         # Phased 20/20/20: phys_opt | manual (pblock + cell_replace SHARE this) | LLM.
         self.phys_opt_timeout = phys_opt_timeout  # phase-1 cap for phys_opt
@@ -1355,51 +1374,81 @@ class DCPOptimizer(DCPOptimizerBase):
         bake it in deterministically so every design gets it, not just when the LLM
         happens to try it. Must run AFTER a fully-routed best exists. Adopts only if it
         beats the protected baseline; otherwise the protected baseline is reloaded."""
-        print("\n=== Deterministic Optimization: explore-route polish (cheap) ===\n")
+        print("\n=== Deterministic Optimization: best-of-N explore-route polish ===\n")
         if getattr(self, "routeopt_mode", "always") == "never":
             print("routeopt disabled (--routeopt-mode never). Skipping.\n")
             return None
         if self.protected_best_dcp is None or not self.protected_best_dcp.exists():
             print("No protected baseline to polish; skipping routeopt.\n")
             return None
+        # route_design -directive Explore is HIGH-VARIANCE: on logicnets one roll gives
+        # WNS -0.417, another -0.408 (+2.46 MHz). A single route often misses the good
+        # roll (this was the old LLM finisher's real edge -- it ran Explore repeatedly and
+        # kept the best). So re-route the SAME placement N times (unroute -> Explore) and
+        # keep the best. Routing-only -> functionally equivalent. N scales DOWN with design
+        # size (a route is cheap on small designs, expensive on big ones) -- same tiers as
+        # the pblock sweep.
+        try:
+            occ_txt = await self.call_tool("vivado_run_tcl", {
+                "command": r'puts "ROCC [llength [get_sites -quiet -filter {SITE_TYPE =~ SLICE* && IS_USED} SLICE_*]]"',
+                "timeout": 60})
+            occ = int(re.search(r"ROCC (\d+)", occ_txt).group(1))
+        except Exception:
+            occ = 99999
+        n_rolls = 3 if occ <= 6000 else (2 if occ <= 12000 else 1)
         wns_before = self.protected_best_wns
-        rt = int(timeout) if timeout else 600
-        print(f"Running route_design -directive Explore (timeout {rt}s)...")
-        await self.call_tool("vivado_route_design", {"directive": "Explore", "timeout": rt})
+        rt = max(300, int((timeout or 1200) / n_rolls))
+        best_wns = None
+        best_dcp = Path(self.temp_dir) / "routeopt_best.dcp"
+        print(f"best-of-{n_rolls} explore-route (occ={occ}, ≤{rt}s/route)...")
 
-        # Only trust the result if the design is still fully routed (a timed-out route
-        # can leave it partially unrouted, which reports an optimistic WNS).
-        route_status = await self.call_tool("vivado_report_route_status", {})
-        fully_routed = ("fully routed" in route_status.lower()) or ("100.00%" in route_status)
-        await self.call_tool("vivado_report_timing_summary", {})
-        wns_after = self.best_wns if (fully_routed and self.best_wns > float('-inf')) else None
+        for i in range(n_rolls):
+            if self._remaining_total() < rt + 60:
+                print(f"⏱ Out of budget; stopping routeopt at roll {i}.\n"); break
+            # INCREMENTAL re-route (route -Explore ON the already-routed baseline) -- this is
+            # the high-variance pass that reaches the good roll (-0.408 / 524.11 on logicnets).
+            # A from-scratch unroute+route is deterministic and MISSES it. Reload the routed
+            # baseline before each roll so every roll re-routes the SAME -0.417 starting point.
+            if i > 0:
+                await self.call_tool("vivado_open_checkpoint", {
+                    "dcp_path": str(self.protected_best_dcp.resolve())})
+            await self.call_tool("vivado_route_design", {"directive": "Explore", "timeout": rt})
+            rs = await self.call_tool("vivado_report_route_status", {})
+            routed = ("fully routed" in rs.lower()) or ("100.00%" in rs)
+            await self.call_tool("vivado_report_timing_summary", {})
+            w = self.best_wns if (routed and self.best_wns > float('-inf')) else None
+            fx = self.calculate_fmax(w, self.clock_period) if w is not None else None
+            print(f"  [roll {i+1}/{n_rolls}] " + (f"WNS {w:.3f} ns"
+                  + (f", {fx:.2f} MHz" if fx is not None else "") if w is not None
+                  else "not fully routed -- discarded"))
+            if w is not None and (best_wns is None or w > best_wns):
+                best_wns = w
+                await self.call_tool("vivado_write_checkpoint", {
+                    "dcp_path": str(best_dcp.resolve()), "force": True})
 
-        if wns_after is not None and wns_after > self.protected_best_wns:
-            await self.call_tool("vivado_write_checkpoint", {
-                "dcp_path": str(output_dcp.resolve()), "force": True})
-            if self.protected_best_dcp is None:
-                self.protected_best_dcp = self.run_dir / "best_protected.dcp"
+        # Adopt the best roll iff it beats the incoming baseline; else restore baseline.
+        if best_wns is not None and best_wns > wns_before and best_dcp.exists():
             try:
-                shutil.copy2(output_dcp, self.protected_best_dcp)
-                self.protected_best_wns = wns_after
+                shutil.copy2(best_dcp, output_dcp)
+                shutil.copy2(best_dcp, self.protected_best_dcp)
             except Exception as e:
-                logger.warning(f"Could not update protected baseline copy: {e}")
-            if wns_after > self.best_wns:
-                self.best_wns = wns_after
-            delta = (wns_after - wns_before) if wns_before > float('-inf') else 0.0
-            fmax_after = self.calculate_fmax(wns_after, self.clock_period)
-            fmax_str = f", fmax: {fmax_after:.2f} MHz" if fmax_after is not None else ""
-            print(f"✓ explore-route improved WNS {wns_before:.3f} → {wns_after:.3f} ns "
-                  f"(Δ {delta:+.3f} ns{fmax_str}). Saving as new baseline.\n")
-            return wns_after
+                logger.warning(f"routeopt: could not save best roll ({e})")
+            self.protected_best_wns = best_wns
+            if best_wns > self.best_wns:
+                self.best_wns = best_wns
+            await self.call_tool("vivado_open_checkpoint", {"dcp_path": str(output_dcp.resolve())})
+            fx = self.calculate_fmax(best_wns, self.clock_period)
+            fstr = f", fmax: {fx:.2f} MHz" if fx is not None else ""
+            print(f"✓ best-of-{n_rolls} explore-route: WNS {wns_before:.3f} → {best_wns:.3f} ns "
+                  f"(Δ {best_wns - wns_before:+.3f} ns{fstr}). Saving as new baseline.\n")
+            return best_wns
 
-        cur = f"{wns_after:.3f} ns" if wns_after is not None else ("not fully routed" if not fully_routed else "unmeasurable")
-        print(f"⚠ explore-route ({cur}) did not beat baseline "
-              f"({self.protected_best_wns:.3f} ns); keeping baseline.")
-        if self.protected_best_dcp is not None and self.protected_best_dcp.exists():
-            await self.call_tool("vivado_open_checkpoint", {
-                "dcp_path": str(self.protected_best_dcp.resolve())})
-            print("✓ Restored baseline into Vivado.\n")
+        cur = f"{best_wns:.3f} ns" if best_wns is not None else "no clean roll"
+        print(f"⚠ best-of-N explore-route ({cur}) did not beat baseline "
+              f"({wns_before:.3f} ns); reverting to the protected baseline.")
+        await self.call_tool("vivado_open_checkpoint", {
+            "dcp_path": str(self.protected_best_dcp.resolve())})
+        print("✓ Restored baseline into Vivado.\n")
         return None
 
     @staticmethod
@@ -1493,70 +1542,97 @@ class DCPOptimizer(DCPOptimizerBase):
                   f"> {DSP_DENSITY_LIMIT}). Global confinement traps datapath designs; the "
                   f"incremental stages do better here.\n")
             return None
-        target = occ * HEADROOM
-        W = max(1, int(round((target / ASPECT) ** 0.5)))
-        H = max(1, int(round(ASPECT * W)))
-        xc = (xmin + xmax) // 2
-        yc = (ymin + ymax) // 2
-        x0 = max(xmin, xc - W // 2); x1 = min(xmax, x0 + W - 1)
-        y0 = max(ymin, yc - H // 2); y1 = min(ymax, y0 + H - 1)
-        pblock_ranges = f"SLICE_X{x0}Y{y0}:SLICE_X{x1}Y{y1}"
-        print(f"Confine box: occ={occ} slices, {HEADROOM}x headroom, aspect {ASPECT} "
-              f"-> {pblock_ranges} (W {x1-x0+1} H {y1-y0+1})")
-
-        # 4. Unplace -> apply pblock -> re-place -> re-route
-        print("Unplacing design...")
-        await self.call_tool("vivado_run_tcl", {"command": "place_design -unplace"})
-        print("Applying pblock constraint...")
-        await self.call_tool("vivado_create_and_apply_pblock", {
-            "pblock_name": "pblock_opt",
-            "ranges": pblock_ranges,
-            "apply_to": "current_design",
-            "is_soft": False,
-        })
-        # Cap place and route by the pblock stage budget (split across the two ops).
-        pr_timeout = int(timeout / 2) if timeout else 3600
-        print(f"Placing design under pblock (timeout {pr_timeout}s)...")
-        await self.call_tool("vivado_place_design", {"directive": "Default", "timeout": pr_timeout})
-        print(f"Routing design (timeout {pr_timeout}s)...")
-        await self.call_tool("vivado_route_design", {"directive": "Default", "timeout": pr_timeout})
-
-        # 5. Check route status + timing
-        route_status = await self.call_tool("vivado_report_route_status", {})
-        fully_routed = ("fully routed" in route_status.lower()) or ("100.00%" in route_status)
-        await self.call_tool("vivado_report_timing_summary", {})
-        try:
-            wns_after = await super().get_wns_for_target_clock(self._call_vivado_tool)
-        except Exception:
-            wns_after = None
-        if wns_after is None and self.best_wns > float('-inf'):
-            wns_after = self.best_wns
-
-        # 6. Adopt only if routed AND improved; otherwise restore the protected baseline.
-        if fully_routed and wns_after is not None and wns_after > self.protected_best_wns:
-            fmax = self.calculate_fmax(wns_after, self.clock_period)
-            fmax_str = f", fmax: {fmax:.2f} MHz" if fmax is not None else ""
-            print(f"✓ pblock improved WNS to {wns_after:.3f} ns (was {self.protected_best_wns:.3f} ns"
-                  f"{fmax_str}). Saving as new baseline.\n")
-            await self.call_tool("vivado_write_checkpoint", {
-                "dcp_path": str(output_dcp.resolve()), "force": True})
-            if self.protected_best_dcp is not None:
-                try:
-                    shutil.copy2(output_dcp, self.protected_best_dcp)
-                except Exception as e:
-                    logger.warning(f"Could not update protected baseline copy: {e}")
-            self.protected_best_wns = wns_after
-            if wns_after > self.best_wns:
-                self.best_wns = wns_after
-            return wns_after
-
-        if not fully_routed:
-            reason = "did not route cleanly"
-        elif wns_after is not None:
-            reason = f"WNS {wns_after:.3f} ns did not beat baseline {self.protected_best_wns:.3f} ns"
+        # 4. SWEEP the confine box ratio. The box geometry is high-leverage and the best
+        # headroom varies by design (logicnets got a big improvement at one ratio). On
+        # SMALL designs a full place+route is cheap, so try a few headrooms and keep the
+        # best; on large designs a single box (sweep would be too slow). 1.5 goes FIRST
+        # (the proven default) so the primary path is always exercised. Each candidate
+        # restarts from the SAME pre-pblock baseline (reloaded from the protected DCP),
+        # so ratios are compared fairly. Adopt the overall best iff it beats the baseline;
+        # otherwise revert -- the keep-if-better + protected-best guarantee is preserved.
+        # SIZE-GRADUATED ratio count: each ratio is a full confined place+route whose cost
+        # scales with design size, so the runtime we spend sweeping must scale DOWN as the
+        # design grows. Big designs -> a single box (1.5x proven default); the sweep runtime
+        # would otherwise dwarf any ratio gain. Small designs -> full 3-ratio sweep (cheap).
+        # (Sweeping needs a protected baseline to restore between ratios; without one, 1 box.)
+        have_baseline = (self.protected_best_dcp is not None and self.protected_best_dcp.exists())
+        if not have_baseline or occ > 12000:
+            headrooms = [HEADROOM]            # BIG (or no baseline): single box, no sweep
+        elif occ > 6000:
+            headrooms = [1.5, 1.3]            # MEDIUM: 2-ratio sweep
         else:
-            reason = "WNS could not be measured"
-        print(f"⚠ pblock {reason}; reverting to the protected baseline.")
+            headrooms = [1.5, 1.3, 1.8]       # SMALL: full 3-ratio sweep
+        # Per-op timeout: confined place_design is SLOWER than unconstrained (the placer has
+        # less freedom), so a too-tight cap makes it soft-timeout and churn. Floor it at 420s
+        # so each place+route completes cleanly; the per-ratio budget guard below still bounds
+        # the total, and the hard-deadline watchdog is the ultimate cap.
+        pr_timeout = max(420, int(timeout / (2 * len(headrooms)))) if timeout else 480
+        pre_pblock_wns = self.protected_best_wns
+        best_sweep_wns = None
+        best_sweep_dcp = Path(self.temp_dir) / "pblock_best.dcp"
+        _tier = "single box (big design)" if len(headrooms) == 1 else f"{len(headrooms)}-ratio sweep"
+        print(f"pblock: {_tier} (occ={occ}, headrooms {headrooms}), aspect {ASPECT}\n")
+
+        for i, hr in enumerate(headrooms):
+            if self._remaining_total() < 2 * pr_timeout + 90:
+                print(f"⏱ Not enough budget for a clean place+route ({self._remaining_total():.0f}s "
+                      f"left, need ≥{2*pr_timeout+90}s); stopping pblock sweep at ratio {i}.\n"); break
+            if i > 0:  # restore the pre-pblock baseline before trying the next ratio
+                await self.call_tool("vivado_open_checkpoint", {
+                    "dcp_path": str(self.protected_best_dcp.resolve())})
+            W = max(1, int(round((occ * hr / ASPECT) ** 0.5)))
+            H = max(1, int(round(ASPECT * W)))
+            xc = (xmin + xmax) // 2; yc = (ymin + ymax) // 2
+            x0 = max(xmin, xc - W // 2); x1 = min(xmax, x0 + W - 1)
+            y0 = max(ymin, yc - H // 2); y1 = min(ymax, y0 + H - 1)
+            pranges = f"SLICE_X{x0}Y{y0}:SLICE_X{x1}Y{y1}"
+            print(f"[sweep {i+1}/{len(headrooms)}] {hr}x box -> {pranges} (W {x1-x0+1} H {y1-y0+1}); "
+                  f"unplace -> confine -> place -> route (each ≤{pr_timeout}s)...")
+            await self.call_tool("vivado_run_tcl", {
+                "command": "if {[llength [get_pblocks -quiet pblock_opt]]} "
+                           "{delete_pblocks [get_pblocks pblock_opt]}; place_design -unplace"})
+            await self.call_tool("vivado_create_and_apply_pblock", {
+                "pblock_name": "pblock_opt", "ranges": pranges,
+                "apply_to": "current_design", "is_soft": False})
+            await self.call_tool("vivado_place_design", {"directive": "Default", "timeout": pr_timeout})
+            await self.call_tool("vivado_route_design", {"directive": "Default", "timeout": pr_timeout})
+            rs = await self.call_tool("vivado_report_route_status", {})
+            routed = ("fully routed" in rs.lower()) or ("100.00%" in rs)
+            await self.call_tool("vivado_report_timing_summary", {})
+            try:
+                w = await super().get_wns_for_target_clock(self._call_vivado_tool)
+            except Exception:
+                w = None
+            if routed and w is not None:
+                fx = self.calculate_fmax(w, self.clock_period)
+                print(f"   -> WNS {w:.3f} ns" + (f", fmax {fx:.2f} MHz" if fx is not None else ""))
+                if best_sweep_wns is None or w > best_sweep_wns:
+                    best_sweep_wns = w
+                    await self.call_tool("vivado_write_checkpoint", {
+                        "dcp_path": str(best_sweep_dcp.resolve()), "force": True})
+            else:
+                print(f"   -> {'not fully routed' if not routed else 'WNS unmeasurable'}; discarding this ratio")
+
+        # 5. Adopt the best sweep result iff it beats the pre-pblock baseline.
+        if best_sweep_wns is not None and best_sweep_wns > pre_pblock_wns and best_sweep_dcp.exists():
+            fmax = self.calculate_fmax(best_sweep_wns, self.clock_period)
+            fmax_str = f", fmax: {fmax:.2f} MHz" if fmax is not None else ""
+            print(f"✓ pblock best (of {len(headrooms)} ratio(s)) WNS {best_sweep_wns:.3f} ns "
+                  f"(was {pre_pblock_wns:.3f} ns{fmax_str}). Saving as new baseline.\n")
+            try:
+                shutil.copy2(best_sweep_dcp, output_dcp)
+                if self.protected_best_dcp is not None:
+                    shutil.copy2(best_sweep_dcp, self.protected_best_dcp)
+            except Exception as e:
+                logger.warning(f"pblock: could not save best sweep DCP ({e})")
+            self.protected_best_wns = best_sweep_wns
+            if best_sweep_wns > self.best_wns:
+                self.best_wns = best_sweep_wns
+            # reload the adopted best into Vivado for the next stage
+            await self.call_tool("vivado_open_checkpoint", {"dcp_path": str(output_dcp.resolve())})
+            return best_sweep_wns
+
+        print(f"⚠ pblock sweep did not beat baseline ({pre_pblock_wns:.3f} ns); reverting.")
         if self.protected_best_dcp is not None and self.protected_best_dcp.exists():
             await self.call_tool("vivado_open_checkpoint", {
                 "dcp_path": str(self.protected_best_dcp.resolve())})
@@ -2590,6 +2666,22 @@ set fh [open {%RESULT%} w]; puts $fh $r; close $fh
         # if a single Vivado place/route runs away (soft budgets can't interrupt it).
         self._arm_watchdog(output_dcp)
 
+        # === FRONT LLM PLANNER (optional, advisory) ===
+        # One up-front call reads the design diagnosis and picks the ordered recipe of
+        # OPTIONAL stages. phys_opt is ALWAYS forced as the first stage (non-negotiable:
+        # it banks the reliable first gain, which is what carried the big designs in beta).
+        # On ANY planner failure we keep the full default recipe, so the floor is never
+        # worse than the proven deterministic flow.
+        if self.use_planner and not self.skip_llm:
+            planner_recipe = await self._run_llm_planner(initial_analysis)
+            if planner_recipe is not None:
+                self.pre_opt_steps = ["phys_opt"] + [s for s in planner_recipe if s != "phys_opt"]
+                self._planner_ran = True
+                print(f"⏱ Planner-selected pipeline: {','.join(self.pre_opt_steps)}\n")
+            else:
+                print("⏱ Planner unavailable/failed -- using the full default recipe "
+                      f"({','.join(self.pre_opt_steps)}).\n")
+
         # === Deterministic pre-LLM optimization pipeline (wall-clock bounded) ===
         # Runs each configured step in order (e.g. phys_opt -> pblock). Every step is
         # functionally equivalent and only keeps a result that beats the protected
@@ -2614,8 +2706,8 @@ set fh [open {%RESULT%} w]; puts $fh $r; close $fh
                 budget = int(min(manual_left, remaining - 30))
             elif step == "pinopt":  # cheap: targeted critical-pin swaps only (~2 min); small cap
                 budget = int(min(300, remaining - 30))
-            elif step == "routeopt":  # explore-route polish: one higher-effort re-route
-                budget = int(min(600, remaining - 30))
+            elif step == "routeopt":  # best-of-N explore-route: needs room for a few routes
+                budget = int(min(1500, remaining - 30))
             elif step == "reimpl":  # final fallback: its own (larger) dedicated budget
                 # WORST-CASE GATE: reimpl runs a full from-scratch place+route whose
                 # internal Vivado ops CANNOT be interrupted mid-run (soft timeouts).
@@ -2683,10 +2775,14 @@ set fh [open {%RESULT%} w]; puts $fh $r; close $fh
             return True
 
         # Trailing LLM phase: run ONLY if 'llm' was not already a positioned pipeline
-        # step (in --pre-opt) and the LLM is not disabled. When 'llm' IS in --pre-opt
-        # (e.g. phys_opt,llm,relocate,...), it already ran at its position in the loop.
-        if "llm" not in self.pre_opt_steps and not self.skip_llm:
+        # step (in --pre-opt), the LLM is not disabled, AND the front planner did not run.
+        # In front-planner mode the LLM's role is planning the recipe, not a finishing
+        # optimization pass (per the front-planner-only design), so we do NOT also run a
+        # trailing finisher.
+        if "llm" not in self.pre_opt_steps and not self.skip_llm and not self._planner_ran:
             await self._run_llm_stage(input_dcp, output_dcp, initial_analysis)
+        elif self._planner_ran:
+            print("Front-planner mode: recipe was chosen up front; no trailing LLM finisher.\n")
         elif self.skip_llm and "llm" not in self.pre_opt_steps:
             print("Skipping LLM stage (--skip-llm). Deterministic baseline is the final result.\n")
 
@@ -2694,6 +2790,94 @@ set fh [open {%RESULT%} w]; puts $fh $r; close $fh
         self.end_time = time.time()
         self._print_optimization_summary()
         return self.protected_best_dcp is not None
+
+    async def _planner_diagnosis(self, initial_analysis: str) -> str:
+        """Build a compact design profile for the planner: worst-path logic/route split,
+        logic levels + CARRY8 count, design size, DSP/BRAM density, plus the existing
+        initial analysis. Best-effort -- any missing field just isn't reported."""
+        prof = []
+        try:
+            rpt = await self.call_tool("vivado_run_tcl", {
+                "command": "report_timing -max_paths 1 -setup -return_string", "timeout": 120})
+            m = re.search(r"logic\s+[\d.]+ns\s+\(([\d.]+)%\)\s+route\s+[\d.]+ns\s+\(([\d.]+)%\)", rpt)
+            if m:
+                prof.append(f"worst_path_logic_pct: {float(m.group(1)):.0f}")
+                prof.append(f"worst_path_route_pct: {float(m.group(2)):.0f}")
+            lm = re.search(r"Logic Levels:\s+(\d+)\s*\(([^)]*)\)", rpt)
+            if lm:
+                cm = re.search(r"CARRY8=(\d+)", lm.group(2))
+                prof.append(f"worst_path_logic_levels: {int(lm.group(1))}")
+                prof.append(f"worst_path_carry8_count: {int(cm.group(1)) if cm else 0}")
+        except Exception as e:
+            logger.warning(f"planner diagnosis (worst-path) failed: {e}")
+        try:
+            stats_tcl = (
+                r'set occ [llength [get_sites -quiet -filter {SITE_TYPE =~ SLICE* && IS_USED} SLICE_*]]; '
+                r'set ndsp [llength [get_sites -quiet -filter {IS_USED} DSP*]]; '
+                r'set nbram [llength [get_sites -quiet -filter {IS_USED} RAMB*]]; '
+                r'puts "PDIAG occ $occ dsp $ndsp bram $nbram"')
+            stats = await self.call_tool("vivado_run_tcl", {"command": stats_tcl, "timeout": 120})
+            sm = re.search(r"PDIAG occ (\d+) dsp (\d+) bram (\d+)", stats)
+            if sm:
+                occ, ndsp, nbram = (int(g) for g in sm.groups())
+                prof.append(f"occupied_slices: {occ}")
+                prof.append(f"dsp_bram_density: {((ndsp + nbram) / occ):.3f}" if occ else "dsp_bram_density: 0")
+                prof.append(f"design_size: {'LARGE' if occ > 20000 else ('MEDIUM' if occ > 5000 else 'SMALL')}")
+        except Exception as e:
+            logger.warning(f"planner diagnosis (size/density) failed: {e}")
+        prof.append(f"pblock_recommended(spread heuristic): {bool(getattr(self, 'pblock_recommended', False))}")
+        if getattr(self, "high_fanout_nets", None):
+            prof.append(f"max_fanout: {self.high_fanout_nets[0][1]} (top high-fanout net)")
+        return "WORST-PATH / DESIGN PROFILE:\n" + "\n".join(prof) + "\n\n" + (initial_analysis or "")
+
+    async def _run_llm_planner(self, initial_analysis: str) -> Optional[list]:
+        """FRONT PLANNER: one LLM call that reads the diagnosis and returns an ordered
+        recipe of OPTIONAL post-phys_opt stages. phys_opt is mandatory and NOT the
+        planner's to choose. Returns a validated list, or None on ANY failure (missing
+        prompt/key, API error, bad JSON, empty/invalid recipe) so the caller uses the
+        full default recipe. This is the safety contract: the planner can only add value,
+        never drop below the proven deterministic flow."""
+        # NOTE: "llm" is deliberately NOT in the menu. Letting the planner append the LLM
+        # finisher triggered a full 50+ call agentic loop (e.g. on amd) that added large
+        # runtime+$ for no measured Fmax gain -- a net SCORE LOSS (gamma+beta penalties).
+        # The OG fanout strategy it would invoke was disproven on boom and rarely helps.
+        # It stays documented in SYSTEM_PROMPT.TXT for manual --no-planner use; the front
+        # planner remains fast + cheap (deterministic recipe only).
+        MENU = {"pblock", "relocate", "pinopt", "reimpl", "routeopt", "cell_replace", "retime"}
+        planner_prompt = load_planner_prompt()
+        if planner_prompt is None or not self.api_key:
+            return None
+        try:
+            diagnosis = await self._planner_diagnosis(initial_analysis)
+        except Exception as e:
+            logger.warning(f"planner: diagnosis build failed ({e}); using default recipe.")
+            return None
+        try:
+            self.llm_call_count += 1
+            logger.info("LLM planner call (recipe selection)")
+            response = self.openai.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "system", "content": planner_prompt},
+                          {"role": "user", "content": f"{diagnosis}\n\nReturn the JSON recipe now."}],
+                max_tokens=512,
+                timeout=60,  # fail fast to the default recipe if OpenRouter hangs
+                extra_body={"usage": {"include": True}})
+            if hasattr(response, "usage") and response.usage and getattr(response.usage, "cost", None) is not None:
+                self.total_cost += float(response.usage.cost)
+            content = (response.choices[0].message.content or "").strip()
+            jm = re.search(r"\{.*\}", content, re.DOTALL)  # tolerate stray prose
+            data = json.loads(jm.group(0) if jm else content)
+            raw = data.get("recipe", [])
+            recipe = [s for s in raw if isinstance(s, str) and s in MENU and s != "phys_opt"]
+            if not recipe:
+                logger.warning("planner: empty/invalid recipe; using default.")
+                return None
+            print(f"🧠 Planner recipe (after mandatory phys_opt): {recipe}")
+            print(f"   rationale: {data.get('rationale', '(none)')}\n")
+            return recipe
+        except Exception as e:
+            logger.warning(f"planner: LLM call/parse failed ({e}); using default recipe.")
+            return None
 
     async def _run_llm_stage(self, input_dcp: Path, output_dcp: Path, initial_analysis: str) -> None:
         """LLM-driven optimization loop. Runs either as a positioned pipeline step ('llm'
@@ -4383,10 +4567,11 @@ Examples:
                         help="Wall-clock budget (s) for the LLM stage (default: 1200 = 20 min)")
     parser.add_argument("--total-timeout", type=int, default=3600,
                         help="Soft cap (s): gates stage STARTS only (default: 3600 = 1 hr)")
-    parser.add_argument("--hard-deadline", type=int, default=3300,
+    parser.add_argument("--hard-deadline", type=int, default=3420,
                         help="HARD wall-clock kill (s): force-writes the protected-best DCP and "
                              "exits, guaranteeing we finish under the 1-hr contest limit even if a "
-                             "Vivado place/route runs away (default: 3300 = 55 min; 0 disables)")
+                             "Vivado place/route runs away (default: 3420 = 57 min, ~3 min AWS "
+                             "safety margin under the 3600s cutoff; 0 disables)")
     parser.add_argument("--cost-cap", type=float, default=1.0,
                         help="Stop the LLM stage before spending more than this many USD (default: 1.0)")
     parser.add_argument(
@@ -4394,6 +4579,14 @@ Examples:
         action="store_true",
         help="Run only the deterministic pre-LLM optimization and skip the LLM stage (fast, ~$0 cost, safe baseline)."
     )
+    parser.add_argument(
+        "--no-planner",
+        dest="use_planner",
+        action="store_false",
+        help="Disable the front LLM planner (recipe selection). phys_opt-first + full default "
+             "recipe still runs. The planner is ON by default; --skip-llm also disables it."
+    )
+    parser.set_defaults(use_planner=True)
 
     args = parser.parse_args()
     
@@ -4480,6 +4673,7 @@ Examples:
         reimpl_route_directive=args.reimpl_route_directive,
         reimpl_skip_if_recovered=args.reimpl_skip_if_recovered,
         skip_llm=args.skip_llm,
+        use_planner=args.use_planner,
         phys_opt_timeout=args.phys_opt_timeout,
         manual_timeout=args.manual_timeout,
         reimpl_timeout=args.reimpl_timeout,
