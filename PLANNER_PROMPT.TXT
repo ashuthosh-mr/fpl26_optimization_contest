@@ -35,26 +35,28 @@ keep-if-better ENDGAMES -- include them by default; the only reason to drop reim
 clear logic-depth/carry wall (where a re-place+route cannot change logic levels) or a huge
 design where it cannot finish in time.
 
-DECISION RULES (from hard-won experience -- follow these):
-1. LOGIC-DEPTH / CARRY-BOUND worst path (high worst_path_logic_pct AND many logic levels
-   AND large carry8 count -- e.g. a sqrt/divide/multiply chain, like >20 levels with a big
-   carry8 count): placement and routing CANNOT fix logic depth, and a re-place+route
-   cannot change the number of logic levels. Use a MINIMAL recipe: ["pinopt","routeopt"].
-   This is the ONE case where dropping pblock/relocate/reimpl is correct -- they cannot
-   help a carry wall. (Be sure it is really carry-bound before trimming this hard.)
-2. ROUTE-BOUND + SPREAD + pure-logic (high worst_path_route_pct, pblock_recommended true,
-   low dsp_bram_density): confinement is the big lever ->
-   ["pblock","relocate","pinopt","reimpl","routeopt"].
-3. ROUTE-BOUND but DSP-DOMINATED (dsp_bram_density high): skip pblock (it traps datapath
-   designs -- a hard density gate skips it anyway); still relocate the register bank toward
-   its macro AND keep reimpl as an endgame ->
-   ["relocate","pinopt","reimpl","routeopt"].
-4. LARGE / CONGESTED design (design_size LARGE): be CONSERVATIVE -- keep the FULL proven
-   recipe ["pblock","relocate","pinopt","reimpl","routeopt"]. The deterministic flow
-   reliably banks gains on big designs (it is what scored on the big benchmarks in beta);
-   do NOT strip stages to save time here.
-5. UNSURE / mixed signals: default to the full recipe
-   ["pblock","relocate","pinopt","reimpl","routeopt"]. When in doubt, do not trim.
+DECISION RULES -- there are only THREE buckets. Classify the design, then emit that recipe.
+Dropping a stage is a DELIBERATE, RARE choice justified ONLY by rule 1 or 2 below.
+
+1. CARRY-BOUND / LOGIC-DEPTH worst path (high worst_path_logic_pct AND many logic levels
+   AND large carry8 count -- e.g. a sqrt/divide/multiply chain: >20 levels with a big
+   carry8 count). Placement and routing CANNOT shorten logic depth. Recipe: MINIMAL
+   ["pinopt","routeopt"]. This is the only case where dropping pblock/relocate/reimpl is
+   correct. Be SURE it is really carry-bound before trimming this hard.
+
+2. DSP-DOMINATED datapath (dsp_bram_density high, e.g. > 0.04). Global confine traps
+   datapath designs (and pblock's own hard density gate skips it anyway), so drop pblock;
+   keep the rest. Recipe: ["relocate","pinopt","reimpl","routeopt"].
+
+3. EVERYTHING ELSE -- i.e. any design that is NOT a carry wall and NOT DSP-dominated
+   (low dsp_bram_density). Recipe: the FULL ["pblock","relocate","pinopt","reimpl","routeopt"].
+   ** ALWAYS INCLUDE pblock here. ** pblock CONFINE is the single biggest lever on
+   pure-logic designs (vexriscv +127 MHz, logicnets +118 MHz) and it OFTEN WINS EVEN WHEN
+   pblock_recommended is FALSE or the design is "small" or the spread looks modest -- the
+   spread heuristic misses real confine wins. pblock is keep-if-better (it reverts if it
+   does not help), so including it on a low-DSP design costs at most a little runtime but
+   protects a potentially huge gain. Do NOT drop pblock based on pblock_recommended, size,
+   or spread. When unsure, you are in this bucket -> full recipe.
 
 OUTPUT FORMAT (JSON only, no prose before or after):
 {"recipe": ["pblock","relocate","pinopt","reimpl","routeopt"],
