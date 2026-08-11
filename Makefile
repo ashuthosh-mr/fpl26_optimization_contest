@@ -224,18 +224,20 @@ setup:
 
 # Build RapidWright from source (git submodule)
 build-rapidwright:
-	@printf "$(COLOR_YELLOW)Building RapidWright from source (optional -- pip 'rapidwright' is the fallback)...$(COLOR_RESET)\n"
-	@if [ ! -f "$(RAPIDWRIGHT_PATH)/gradlew" ]; then \
-		if git rev-parse --git-dir >/dev/null 2>&1 && [ -f .gitmodules ]; then \
-			printf "$(COLOR_YELLOW)Initializing RapidWright git submodule...$(COLOR_RESET)\n"; \
-			git submodule update --init RapidWright || true; \
-		fi; \
-	fi
-	@if [ -f "$(RAPIDWRIGHT_PATH)/gradlew" ]; then \
+	@if [ -n "$(wildcard $(RAPIDWRIGHT_PATH)/jars/*.jar)" ] && [ -d "$(RAPIDWRIGHT_PATH)/bin/com" ]; then \
+		printf "$(COLOR_GREEN)✓ RapidWright already built (bundled jars + compiled classes present); skipping rebuild.$(COLOR_RESET)\n"; \
+	elif [ -f "$(RAPIDWRIGHT_PATH)/gradlew" ]; then \
+		printf "$(COLOR_YELLOW)Building RapidWright from source...$(COLOR_RESET)\n"; \
 		cd "$(RAPIDWRIGHT_PATH)" && ./gradlew compileJava -p "$(RAPIDWRIGHT_PATH)" && \
 		printf "$(COLOR_GREEN)✓ RapidWright built from source$(COLOR_RESET)\n"; \
+	elif git rev-parse --git-dir >/dev/null 2>&1 && [ -f .gitmodules ]; then \
+		printf "$(COLOR_YELLOW)Initializing RapidWright git submodule...$(COLOR_RESET)\n"; \
+		git submodule update --init RapidWright || true; \
+		if [ -f "$(RAPIDWRIGHT_PATH)/gradlew" ]; then \
+			cd "$(RAPIDWRIGHT_PATH)" && ./gradlew compileJava -p "$(RAPIDWRIGHT_PATH)"; \
+		fi; \
 	else \
-		printf "$(COLOR_YELLOW)⚠ No local RapidWright source (fresh unzip / no submodule); using the pip 'rapidwright' package (its own bundled jars). This is expected and supported.$(COLOR_RESET)\n"; \
+		printf "$(COLOR_YELLOW)⚠ No local RapidWright source (fresh unzip / no submodule); using the pip 'rapidwright' package (its own bundled jars). Supported fallback.$(COLOR_RESET)\n"; \
 	fi
 
 # Run optimizer target: Run dcp_optimizer.py (output DCP name generated automatically)
